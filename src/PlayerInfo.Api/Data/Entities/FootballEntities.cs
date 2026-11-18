@@ -1,0 +1,38 @@
+namespace PlayerInfo.Api.Data.Entities;
+
+public sealed class Team
+{
+    public int Id { get; set; }
+    public int ExternalApiId { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string? Country { get; set; }
+    public string? LogoUrl { get; set; }
+    public int? LeagueExternalId { get; set; }
+    public bool IsTracked { get; set; } = true;
+    public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+
+    public ICollection<Player> Players { get; set; } = [];
+}
+
+public sealed class Player
+{
+    public int Id { get; set; }
+    public int ExternalApiId { get; set; }
+    public int? TeamId { get; set; }
+    public Team? Team { get; set; }
+    public string FullName { get; set; } = string.Empty;
+    public string? Position { get; set; }
+    public int? Number { get; set; }
+    public string? PhotoUrl { get; set; }
+    public bool IsTracked { get; set; } = true;
+    public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class WatchlistAlias
+{
+    public int Id { get; set; }
+    public string EntityType { get; set; } = "Team"; // "Team" or "Player"
+    public int EntityId { get; set; }
+    public string Keyword { get; set; } = string.Empty;
+    public string Language { get; set; } = "en"; // "en" or "vi"
+}
