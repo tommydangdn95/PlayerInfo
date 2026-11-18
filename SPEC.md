@@ -13,7 +13,7 @@ It runs as a Dockerized web service on **Render (Free Tier)** backed by **Neon S
 ### Core Goals
 1. Sync accurate structured football data (injuries, transfers, match fixtures/results, team rosters) without exceeding free-tier API limits.
 2. Aggregate daily football news for tracked teams and players from free RSS feeds (Google News RSS, BBC Sport, ESPN, VnExpress) and NewsData.io.
-3. Deduplicate articles using normalized URL SHA-256 hashes.
+3. Deduplicate articles using normalized URL SHA-256 hashes plus a normalized-title key (catches the same story from Google News and the publisher's own feed).
 4. Batch unprocessed articles to **Gemini API** (JSON mode) to filter clickbait/spam, categorize topics, link entities, and generate concise Vietnamese summaries (`SummaryVi`).
 5. Optionally send daily digests to a **Telegram** chat and expose REST endpoints for querying news, injuries, transfers, and managing the watchlist.
 
@@ -41,10 +41,12 @@ PlayerInfo/
 ├── README.md                           # Deployment & setup instructions
 ├── SPEC.md                             # This specification
 ├── src/PlayerInfo.Api/
-│   ├── Program.cs                      # DI wiring, PORT binding, EnsureCreatedAsync(), OpenAPI
-│   ├── appsettings.json                # Non-secret defaults & RSS feed list
+│   ├── Program.cs                      # DI wiring, PORT binding, per-client resilience, DB init, OpenAPI
+│   ├── appsettings.json                # Non-secret defaults, tracked leagues & RSS feed list
 │   ├── Configuration/
 │   │   └── CollectorOptions.cs         # ApiKeysOptions, CronOptions, TelegramOptions, CollectorOptions
+│   ├── Security/
+│   │   └── RequireCronSecretAttribute.cs # X-Cron-Secret filter for jobs & watchlist write endpoints
 │   ├── Background/
 │   │   └── JobRunnerService.cs         # Bounded Channel<JobRequest> + BackgroundService worker
 │   ├── Controllers/
@@ -54,6 +56,8 @@ PlayerInfo/
 │   │   └── WatchlistController.cs      # CRUD for tracked teams & search keyword aliases
 │   ├── Data/
 │   │   ├── AppDbContext.cs             # EF Core DbContext + indexes/constraints
+│   │   ├── DatabaseInitializer.cs      # Migrate() on startup (+ baseline for legacy EnsureCreated DBs), design-time factory
+│   │   ├── Migrations/                 # EF Core migrations (InitialCreate, ...)
 │   │   └── Entities/
 │   │       ├── FootballEntities.cs     # Team, Player, WatchlistAlias
 │   │       ├── NewsEntities.cs         # NewsArticle, ArticleEntity
@@ -66,9 +70,9 @@ PlayerInfo/
 │   │   └── TelegramNotifier.cs         # Optional Telegram Bot API digest sender
 │   └── Services/
 │       ├── ConnectionStringHelper.cs   # Converts Neon postgresql:// URI -> Npgsql key-value string
-│       ├── Deduplicator.cs             # Strips tracking query params & computes SHA-256 UrlHash
-│       ├── QuotaManager.cs             # Reads/increments ApiQuotaLogs per provider per UTC day
-│       └── CollectorPipeline.cs        # Orchestrates Full, TransfersNews, News, and Roster modes
+│       ├── Deduplicator.cs             # URL normalization + SHA-256 UrlHash, normalized title key
+│       ├── QuotaManager.cs             # Reads/increments ApiQuotaLogs per provider per UTC day (own DbContext per call)
+│       └── CollectorPipeline.cs        # Orchestrates Full, TransfersNews, News, Roster modes as isolated steps
 └── tests/PlayerInfo.UnitTests/
     ├── Helpers/TestHelpers.cs
     ├── ClientsTests.cs
@@ -87,8 +91,9 @@ PlayerInfo/
 Render Free spins down after 15 minutes of inactivity (30–60s cold start), while `cron-job.org` has a ~30s HTTP timeout. Therefore:
 1. `cron-job.org` sends `GET /api/health` 2 minutes before each job to wake the container.
 2. `cron-job.org` sends `POST /api/jobs/run?mode={mode}` with header `X-Cron-Secret`.
-3. `JobsController` validates the secret and enqueues a `JobRequest` into `JobQueue` (`Channel<JobRequest>`), returning **`202 Accepted`** immediately.
+3. `RequireCronSecretAttribute` validates the secret, then `JobsController` enqueues a `JobRequest` into `JobQueue` (`Channel<JobRequest>`), returning **`202 Accepted`** immediately.
 4. `JobRunnerService` executes `CollectorPipeline.RunAsync(mode)` in the background.
+5. The pipeline runs as named steps (`SyncInjuries`, `SyncFixtures`, `SyncTransfers`, `IngestNews`, `EnrichNews`, `NotifyTelegram`). A failing step is logged, its pending EF changes are discarded, and the remaining steps still run.
 
 ### Supported Modes (`CollectorMode`)
 | Mode query param | Enum | Tasks Executed |
@@ -113,21 +118,21 @@ Render Free spins down after 15 minutes of inactivity (30–60s cold start), whi
 
 | Provider | Free Limit | Safety Cap in App | Enforcement Strategy |
 | :--- | :--- | :--- | :--- |
-| **API-Football** | 100 req/day | `90/day` (`ApiFootballDailyLimit`) | Query by `league` or `date` instead of per-player; `QuotaManager` blocks calls once `>= 90` in `ApiQuotaLogs`. |
-| **NewsData.io** | 200 credits/day | `180/day` (`NewsDataDailyLimit`) | Single combined query per run; `QuotaManager` blocks calls once `>= 180`. |
+| **API-Football** | 100 req/day | `90/day` (`ApiFootballDailyLimit`) | Query by `league` or `date` instead of per-player; `QuotaManager` blocks calls once `>= 90` in `ApiQuotaLogs`. Each request is counted *before* sending and the HTTP client has no automatic retries. Daily budget is about `14 + 4N` requests (5 leagues, N tracked teams), so ~19 teams max. HTTP-200 responses with an `errors` field (plan/season limits) are logged. |
+| **NewsData.io** | 200 credits/day | `180/day` (`NewsDataDailyLimit`) | Single combined query per run (max 100 chars, multi-word keywords quoted); counted before sending, no retries; `QuotaManager` blocks calls once `>= 180`. |
 | **Google News RSS** | Unofficial / IP throttle risk | 1.2–2.5s random jitter | Group aliases per entity with `OR` + `when:1d`; delay between requests. |
-| **Gemini API** | Free RPM/RPD limits | Batch size `15` (`GeminiBatchSize`) | Up to 45 pending articles processed per run (3 batches) using structured JSON output. |
+| **Gemini API** | Free RPM/RPD limits | Batch size `15` (`GeminiBatchSize`) | Up to 45 pending articles per run (3 batches) with `responseSchema` structured output; 90s attempt timeout, 1 retry. On failure the run stops calling Gemini and articles stay pending for the next run; articles pending > 48h are given up (`IsAiProcessed = true`, `IsNotified = true`). |
 | **Neon Postgres** | 1 GB storage, 100 CU-hrs/mo | Store metadata + short `SummaryVi` only | Never store full article HTML bodies or binary images. No `JobExecutionLogs` table (detailed logs go to `stdout` for Render Logs). |
 
 ---
 
 ## 6. Database Schema (`AppDbContext`)
 
-Tables auto-created on startup via `db.Database.EnsureCreatedAsync()`:
+Schema is managed by **EF Core migrations** (`Data/Migrations`), applied on startup by `DatabaseInitializer` (`Database.MigrateAsync()`). A database created by the earlier `EnsureCreated()` startup is detected and `InitialCreate` is recorded as applied. The InMemory provider (Development without a connection string) uses `EnsureCreated()`. Tables:
 
 - **`Teams`**: `Id`, `ExternalApiId` (unique), `Name`, `Country`, `LogoUrl`, `LeagueExternalId`, `IsTracked`, `UpdatedAtUtc`
 - **`Players`**: `Id`, `ExternalApiId` (unique), `TeamId` (FK nullable), `FullName`, `Position`, `Number`, `PhotoUrl`, `IsTracked`, `UpdatedAtUtc`
-- **`WatchlistAliases`**: `Id`, `EntityType` (`Team` | `Player`), `EntityId`, `Keyword`, `Language` (`en` | `vi`)
+- **`WatchlistAliases`**: `Id`, `EntityType` (`Team` | `Player`), `EntityId` (internal `Teams.Id` / `Players.Id`), `Keyword`, `Language` (`en` | `vi`)
 - **`NewsArticles`**: `Id`, `UrlHash` (SHA-256 unique), `Url`, `Title`, `Snippet`, `SourceName`, `Language`, `SummaryVi`, `Category` (`Injury` | `Transfer` | `MatchPerformance` | `OffPitch` | `Other`), `IsRelevant`, `IsAiProcessed`, `IsNotified`, `PublishedAtUtc`, `FetchedAtUtc`
 - **`ArticleEntities`**: Composite PK `(ArticleId, EntityType, EntityId)` linking articles to `Teams` or `Players`
 - **`PlayerInjuries`**: `Id`, `PlayerExternalId`, `PlayerName`, `TeamExternalId`, `TeamName`, `Reason`, `Type`, `ReportedDateUtc`, `FetchedAtUtc`
@@ -142,29 +147,33 @@ Tables auto-created on startup via `db.Database.EnsureCreatedAsync()`:
 | Method | Path | Auth | Description |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/api/health` | None | Probes DB connectivity; used as Render wake-up ping. |
-| `POST` | `/api/jobs/run?mode={mode}` | `X-Cron-Secret` (if configured) | Enqueues pipeline job and returns `202 Accepted`. |
+| `POST` | `/api/jobs/run?mode={mode}` | `X-Cron-Secret` | Enqueues pipeline job and returns `202 Accepted`. |
 | `GET` | `/api/jobs/quota` | None | Returns today's UTC usage for `ApiFootball` and `NewsData`. |
 | `GET` | `/api/news?category=&page=1&pageSize=20` | None | Paginated relevant news articles ordered by `PublishedAtUtc` desc. |
 | `GET` | `/api/news/injuries?limit=30` | None | Latest tracked player injuries. |
 | `GET` | `/api/news/transfers?limit=30` | None | Latest tracked player transfers. |
 | `GET` | `/api/watchlist/teams` | None | List tracked teams. |
-| `POST` | `/api/watchlist/teams` | None | Add a team (`externalApiId`, `name`, `country`, `leagueExternalId`). |
+| `POST` | `/api/watchlist/teams` | `X-Cron-Secret` | Add a team (`externalApiId`, `name`, `country`, `leagueExternalId`). `409` if `externalApiId` exists. |
 | `GET` | `/api/watchlist/aliases` | None | List search keyword aliases. |
-| `POST` | `/api/watchlist/aliases` | None | Add a keyword alias (`entityType`, `entityId`, `keyword`, `language`). |
-| `DELETE` | `/api/watchlist/aliases/{id}` | None | Remove a keyword alias. |
+| `POST` | `/api/watchlist/aliases` | `X-Cron-Secret` | Add a keyword alias (`entityType`, `entityId`, `keyword`, `language`). `400` for unknown type/entity/language, `409` for duplicates. |
+| `DELETE` | `/api/watchlist/aliases/{id}` | `X-Cron-Secret` | Remove a keyword alias. |
+
+`X-Cron-Secret` is checked only when `Cron:SecretKey` is set (a warning is logged at startup outside Development if it is not).
 
 ---
 
 ## 8. Configuration & Environment Variables
 
 Secrets must never be committed to `appsettings.json`. Set via Render Environment Variables:
-- `ConnectionStrings__DefaultConnection` (or `DATABASE_URL`) — supports both `Host=...` and Neon's `postgresql://...` URI via `ConnectionStringHelper.Normalize`.
+- `ConnectionStrings__DefaultConnection` (or `DATABASE_URL`) — supports both `Host=...` and Neon's `postgresql://...` URI via `ConnectionStringHelper.Normalize`. Required outside Development (startup fails without it); in Development an InMemory database is used when it is empty.
 - `PORT` — automatically bound by `Program.cs` when set by Render.
 - `Cron__SecretKey`
 - `ApiKeys__ApiFootball`
 - `ApiKeys__NewsData` (optional)
 - `ApiKeys__Gemini` (optional; if omitted, articles are marked `IsAiProcessed = true` without AI summary)
 - `Telegram__BotToken` & `Telegram__ChatId` (optional)
+
+`Collector:TrackedLeagueIds` and `Collector:SportsRssFeeds` live in `appsettings.json`. Their C# defaults are applied only when the configured list is empty (`CollectorOptions.ApplyDefaults`), because the configuration binder appends to initialized lists. `System.Net.Http.HttpClient` logging is set to `Warning` so request URLs (the Telegram bot token is in the path) are not logged.
 
 ---
 
@@ -173,8 +182,11 @@ Secrets must never be committed to `appsettings.json`. Set via Render Environmen
 1. **Preserve Quota Guards:** Any new endpoint call to `API-Football` or `NewsData.io` must check `QuotaManager.CanConsumeAsync` before sending and call `QuotaManager.IncrementAsync` afterward. Never loop per-player over `API-Football`.
 2. **Preserve Cold-Start Resilience:** Do not make `POST /api/jobs/run` synchronous; keep `JobQueue` fire-and-forget (`202 Accepted`) and keep `EnableRetryOnFailure` on `Npgsql`.
 3. **Keep DB Footprint Lean:** Do not persist full article HTML or verbose debug logs in PostgreSQL. Application logs go to `ILogger` (`stdout`).
-4. **Build & Test Command:**
+4. **No Retries on Quota-Guarded Clients:** Keep automatic retries disabled for API-Football/NewsData (each attempt costs quota) and for Telegram (a retried POST can duplicate a digest).
+5. **Keep Pipeline Steps Isolated:** New pipeline work goes in its own step in `CollectorPipeline.RunAsync`; clients return empty/failed results instead of throwing for expected provider errors.
+6. **Schema Changes Need a Migration:** After changing entities or `AppDbContext`, run `dotnet ef migrations add <Name> -p src/PlayerInfo.Api -o Data/Migrations`.
+7. **Build & Test Command:**
    ```bash
    dotnet test --no-restore -p:UseSharedCompilation=false -m:1
    ```
-   *(All unit tests use `EF Core InMemory` and `StubHttpMessageHandler` — no live DB or external API keys required.)*
+   *(All unit tests use `EF Core InMemory` and `StubHttpMessageHandler` — no live DB or external API keys required. Migrations themselves are not covered by tests.)*

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Configuration;
@@ -13,7 +14,17 @@ public sealed class TelegramNotifier(
     IOptions<TelegramOptions> options,
     ILogger<TelegramNotifier> logger)
 {
-    public async Task SendDigestAsync(
+    /// <summary>Telegram rejects messages over 4096 characters; keep a margin.</summary>
+    public const int MaxMessageLength = 4000;
+
+    public bool IsEnabled => options.Value.Enabled;
+
+    /// <summary>
+    /// Sends a digest built from the start of <paramref name="articles"/>.
+    /// Returns how many articles (from the start of the list) were delivered: only those
+    /// should be marked as notified. Returns 0 if sending failed.
+    /// </summary>
+    public async Task<int> SendDigestAsync(
         IReadOnlyList<NewsArticle> articles,
         string mode,
         CancellationToken ct = default)
@@ -21,40 +32,65 @@ public sealed class TelegramNotifier(
         var cfg = options.Value;
         if (!cfg.Enabled || articles.Count == 0)
         {
-            return;
+            return 0;
         }
 
-        var sb = new StringBuilder();
-        sb.AppendLine($"<b>⚽ Bản tin bóng đá ({mode}) - {DateTime.UtcNow.AddHours(7):HH:mm dd/MM}</b>");
-        sb.AppendLine();
-
-        foreach (var a in articles.Take(10))
+        var (text, included) = BuildMessage(articles, mode, DateTime.UtcNow);
+        if (included == 0)
         {
-            var summary = string.IsNullOrWhiteSpace(a.SummaryVi) ? a.Title : a.SummaryVi;
-            sb.AppendLine($"• <b>[{EscapeHtml(a.Category)}]</b> {EscapeHtml(summary)}");
-            sb.AppendLine($"  <a href=\"{a.Url}\">{EscapeHtml(a.SourceName)}</a>");
+            return 0;
         }
 
-        if (articles.Count > 10)
+        try
         {
-            sb.AppendLine($"\n<i>...và {articles.Count - 10} tin khác trong database.</i>");
+            var url = $"https://api.telegram.org/bot{cfg.BotToken}/sendMessage";
+            using var res = await http.PostAsJsonAsync(url, new
+            {
+                chat_id = cfg.ChatId,
+                text,
+                parse_mode = "HTML",
+                disable_web_page_preview = true
+            }, ct);
+
+            if (!res.IsSuccessStatusCode)
+            {
+                var body = await res.Content.ReadAsStringAsync(ct);
+                logger.LogWarning("Telegram API returned {StatusCode}: {Body}", res.StatusCode, body);
+                return 0;
+            }
+
+            return included;
         }
-
-        var url = $"https://api.telegram.org/bot{cfg.BotToken}/sendMessage";
-        using var res = await http.PostAsJsonAsync(url, new
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            chat_id = cfg.ChatId,
-            text = sb.ToString(),
-            parse_mode = "HTML",
-            disable_web_page_preview = true
-        }, ct);
-
-        if (!res.IsSuccessStatusCode)
-        {
-            logger.LogWarning("Telegram API returned {StatusCode}", res.StatusCode);
+            logger.LogWarning(ex, "Telegram digest failed to send");
+            return 0;
         }
     }
 
-    private static string EscapeHtml(string input)
-        => input.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+    internal static (string Text, int Included) BuildMessage(IReadOnlyList<NewsArticle> articles, string mode, DateTime utcNow)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"<b>⚽ Bản tin bóng đá ({WebUtility.HtmlEncode(mode)}) - {utcNow.AddHours(7):HH:mm dd/MM}</b>");
+        sb.AppendLine();
+
+        var included = 0;
+        foreach (var a in articles)
+        {
+            var summary = string.IsNullOrWhiteSpace(a.SummaryVi) ? a.Title : a.SummaryVi;
+            var entry =
+                $"• <b>[{WebUtility.HtmlEncode(a.Category)}]</b> {WebUtility.HtmlEncode(summary)}\n" +
+                $"  <a href=\"{WebUtility.HtmlEncode(a.Url)}\">{WebUtility.HtmlEncode(a.SourceName)}</a>\n";
+
+            if (sb.Length + entry.Length > MaxMessageLength)
+            {
+                break;
+            }
+
+            sb.Append(entry);
+            included++;
+        }
+
+        return (sb.ToString(), included);
+    }
 }

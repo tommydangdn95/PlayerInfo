@@ -10,9 +10,18 @@ namespace PlayerInfo.Api.Clients;
 public sealed record GeminiArticleResult(
     [property: JsonPropertyName("articleId")] long ArticleId,
     [property: JsonPropertyName("isRelevant")] bool IsRelevant,
-    [property: JsonPropertyName("category")] string Category,
-    [property: JsonPropertyName("summaryVi")] string SummaryVi,
-    [property: JsonPropertyName("matchedEntities")] List<string> MatchedEntities);
+    [property: JsonPropertyName("category")] string? Category,
+    [property: JsonPropertyName("summaryVi")] string? SummaryVi,
+    [property: JsonPropertyName("matchedEntities")] List<string>? MatchedEntities);
+
+/// <summary>
+/// Outcome of one Gemini batch. <see cref="Succeeded"/> is false when the call failed
+/// (HTTP error, timeout, unparsable output), so the caller can retry those articles later.
+/// </summary>
+public sealed record GeminiBatchResult(bool Succeeded, IReadOnlyList<GeminiArticleResult> Articles)
+{
+    public static readonly GeminiBatchResult Failed = new(false, []);
+}
 
 /// <summary>
 /// Batches unprocessed news articles into a single Gemini API call returning structured JSON.
@@ -23,77 +32,115 @@ public sealed class GeminiEnricherClient(
     IOptions<CollectorOptions> collectorOptions,
     ILogger<GeminiEnricherClient> logger)
 {
+    public static readonly IReadOnlyList<string> Categories = ["Injury", "Transfer", "MatchPerformance", "OffPitch", "Other"];
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public async Task<IReadOnlyList<GeminiArticleResult>> EnrichBatchAsync(
+    /// <summary>
+    /// Structured-output schema so Gemini returns exactly a JSON array of article results.
+    /// </summary>
+    private static readonly object ResponseSchema = new
+    {
+        type = "ARRAY",
+        items = new
+        {
+            type = "OBJECT",
+            properties = new Dictionary<string, object>
+            {
+                ["articleId"] = new { type = "INTEGER" },
+                ["isRelevant"] = new { type = "BOOLEAN" },
+                ["category"] = new { type = "STRING", @enum = Categories },
+                ["summaryVi"] = new { type = "STRING" },
+                ["matchedEntities"] = new { type = "ARRAY", items = new { type = "STRING" } }
+            },
+            required = new[] { "articleId", "isRelevant", "category", "summaryVi", "matchedEntities" }
+        }
+    };
+
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(apiKeys.Value.Gemini);
+
+    public async Task<GeminiBatchResult> EnrichBatchAsync(
         IReadOnlyList<NewsArticle> batch,
         IReadOnlyList<string> trackedEntityNames,
         CancellationToken ct = default)
     {
-        var key = apiKeys.Value.Gemini;
-        if (string.IsNullOrWhiteSpace(key) || batch.Count == 0)
+        if (!IsConfigured || batch.Count == 0)
         {
-            return [];
+            return GeminiBatchResult.Failed;
         }
-
-        var prompt = BuildPrompt(batch, trackedEntityNames);
-        var model = collectorOptions.Value.GeminiModel;
-        var url = $"v1beta/models/{model}:generateContent?key={Uri.EscapeDataString(key)}";
 
         var payload = new
         {
             contents = new[]
             {
-                new { parts = new[] { new { text = prompt } } }
+                new { parts = new[] { new { text = BuildPrompt(batch, trackedEntityNames) } } }
             },
             generationConfig = new
             {
                 responseMimeType = "application/json",
+                responseSchema = ResponseSchema,
                 temperature = 0.2
             }
         };
 
-        using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-        using var res = await http.PostAsync(url, content, ct);
-        if (!res.IsSuccessStatusCode)
+        string? jsonText;
+        try
         {
-            var errBody = await res.Content.ReadAsStringAsync(ct);
-            logger.LogWarning("Gemini API returned {StatusCode}: {Body}", res.StatusCode, errBody);
-            return [];
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"v1beta/models/{collectorOptions.Value.GeminiModel}:generateContent")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+            };
+            // Key in a header rather than the query string so it never ends up in URLs/logs.
+            req.Headers.TryAddWithoutValidation("x-goog-api-key", apiKeys.Value.Gemini);
+
+            using var res = await http.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                var errBody = await res.Content.ReadAsStringAsync(ct);
+                logger.LogWarning("Gemini API returned {StatusCode}: {Body}", res.StatusCode, errBody);
+                return GeminiBatchResult.Failed;
+            }
+
+            var responseDoc = await res.Content.ReadFromJsonAsync<GeminiGenerateResponse>(JsonOptions, ct);
+            jsonText = responseDoc?.Candidates?.FirstOrDefault()?.Content?.Parts?.FirstOrDefault()?.Text;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Gemini request failed for a batch of {Count} articles", batch.Count);
+            return GeminiBatchResult.Failed;
         }
 
-        var responseDoc = await res.Content.ReadFromJsonAsync<GeminiGenerateResponse>(JsonOptions, ct);
-        var jsonText = responseDoc?.Candidates?.FirstOrDefault()?.Content?.Parts?.FirstOrDefault()?.Text;
         if (string.IsNullOrWhiteSpace(jsonText))
         {
-            return [];
+            logger.LogWarning("Gemini returned an empty response for a batch of {Count} articles", batch.Count);
+            return GeminiBatchResult.Failed;
         }
 
         try
         {
             var parsed = JsonSerializer.Deserialize<List<GeminiArticleResult>>(jsonText, JsonOptions);
-            return parsed ?? [];
+            return new GeminiBatchResult(true, parsed ?? []);
         }
         catch (JsonException ex)
         {
             logger.LogWarning(ex, "Failed to parse Gemini JSON output: {Raw}", jsonText);
-            return [];
+            return GeminiBatchResult.Failed;
         }
     }
 
     private static string BuildPrompt(IReadOnlyList<NewsArticle> batch, IReadOnlyList<string> trackedEntities)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("You are a football news analyst. Analyze the following news articles and return ONLY a JSON array.");
+        sb.AppendLine("You are a football news analyst. Analyze the following news articles and return ONLY a JSON array with one object per article.");
         sb.AppendLine("Each object in the array must have:");
-        sb.AppendLine("- articleId (number)");
+        sb.AppendLine("- articleId (number, copied from ID)");
         sb.AppendLine("- isRelevant (boolean: false if clickbait, betting spam, or unrelated to football)");
-        sb.AppendLine("- category (one of: Injury, Transfer, MatchPerformance, OffPitch, Other)");
+        sb.AppendLine($"- category (one of: {string.Join(", ", Categories)})");
         sb.AppendLine("- summaryVi (concise 1-2 sentence summary in Vietnamese)");
-        sb.AppendLine("- matchedEntities (array of team/player names mentioned, prioritizing tracked list below)");
+        sb.AppendLine("- matchedEntities (array of tracked team/player names from the list below that the article is about, using the exact spelling from the list)");
         sb.AppendLine();
         sb.AppendLine($"Tracked entities: {string.Join(", ", trackedEntities)}");
         sb.AppendLine();

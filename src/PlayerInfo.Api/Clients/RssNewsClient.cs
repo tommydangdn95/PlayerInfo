@@ -28,15 +28,27 @@ public sealed class RssNewsClient(HttpClient http, ILogger<RssNewsClient> logger
         var encodedQuery = Uri.EscapeDataString($"{query} when:1d");
         var url = $"https://news.google.com/rss/search?q={encodedQuery}&hl={hl}&gl={gl}&ceid={ceid}";
 
-        return await FetchFeedAsync(url, "Google News", language, ct);
+        return await FetchFeedAsync(url, "Google News", language, stripSourceSuffix: true, ct);
     }
 
     public Task<IReadOnlyList<RawNewsItem>> FetchSportsFeedAsync(
         RssFeedSource source, CancellationToken ct = default)
-        => FetchFeedAsync(source.Url, source.Name, source.Language, ct);
+        => FetchFeedAsync(source.Url, source.Name, source.Language, stripSourceSuffix: false, ct);
+
+    /// <summary>
+    /// Google News titles look like "Headline - Publisher"; drop the publisher suffix so the
+    /// title matches the same story fetched directly from the publisher's feed.
+    /// </summary>
+    public static string StripSourceSuffix(string title, string sourceName)
+    {
+        var suffix = " - " + sourceName;
+        return title.Length > suffix.Length && title.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+            ? title[..^suffix.Length].TrimEnd()
+            : title;
+    }
 
     private async Task<IReadOnlyList<RawNewsItem>> FetchFeedAsync(
-        string feedUrl, string defaultSource, string language, CancellationToken ct)
+        string feedUrl, string defaultSource, string language, bool stripSourceSuffix, CancellationToken ct)
     {
         try
         {
@@ -79,6 +91,11 @@ public sealed class RssNewsClient(HttpClient http, ILogger<RssNewsClient> logger
                 if (string.IsNullOrWhiteSpace(sourceName))
                 {
                     sourceName = defaultSource;
+                }
+
+                if (stripSourceSuffix)
+                {
+                    title = StripSourceSuffix(title, sourceName);
                 }
 
                 var published = entry.PublishDate != DateTimeOffset.MinValue

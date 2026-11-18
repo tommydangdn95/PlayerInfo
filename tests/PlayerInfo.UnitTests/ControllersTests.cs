@@ -1,39 +1,82 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.AspNetCore.Mvc.Abstractions;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Background;
 using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Controllers;
 using PlayerInfo.Api.Data.Entities;
-using PlayerInfo.Api.Services;
+using PlayerInfo.Api.Security;
 using PlayerInfo.UnitTests.Helpers;
 
 namespace PlayerInfo.UnitTests;
 
 public sealed class ControllersTests
 {
-    [Fact]
-    public async Task JobsController_Run_ReturnsUnauthorized_WhenSecretMismatch()
+    private static AuthorizationFilterContext RunCronSecretFilter(string? configuredSecret, string? headerValue)
     {
-        await using var db = TestDbFactory.CreateInMemory();
-        var queue = new JobQueue();
-        var quota = new QuotaManager(db, NullLogger<QuotaManager>.Instance);
-        var controller = new JobsController(queue, quota, Options.Create(new CronOptions { SecretKey = "my-secret" }));
+        var services = new ServiceCollection()
+            .AddSingleton(Options.Create(new CronOptions { SecretKey = configuredSecret ?? string.Empty }))
+            .BuildServiceProvider();
 
-        var result = await controller.RunAsync("news", "wrong-secret");
+        var http = new DefaultHttpContext { RequestServices = services };
+        if (headerValue is not null)
+        {
+            http.Request.Headers[RequireCronSecretAttribute.HeaderName] = headerValue;
+        }
 
-        Assert.IsType<UnauthorizedObjectResult>(result);
+        var context = new AuthorizationFilterContext(
+            new ActionContext(http, new RouteData(), new ActionDescriptor()),
+            new List<IFilterMetadata>());
+        new RequireCronSecretAttribute().OnAuthorization(context);
+        return context;
+    }
+
+    [Theory]
+    [InlineData("wrong-secret")]
+    [InlineData("my-secre")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void RequireCronSecret_RejectsMissingOrWrongHeader(string? header)
+    {
+        var context = RunCronSecretFilter("my-secret", header);
+        Assert.IsType<UnauthorizedObjectResult>(context.Result);
+    }
+
+    [Fact]
+    public void RequireCronSecret_AllowsMatchingHeader()
+    {
+        var context = RunCronSecretFilter("my-secret", "my-secret");
+        Assert.Null(context.Result);
+    }
+
+    [Fact]
+    public void RequireCronSecret_AllowsAll_WhenNoSecretConfigured()
+    {
+        var context = RunCronSecretFilter(null, null);
+        Assert.Null(context.Result);
+    }
+
+    [Theory]
+    [InlineData(typeof(JobsController), nameof(JobsController.RunAsync))]
+    [InlineData(typeof(WatchlistController), nameof(WatchlistController.AddTeamAsync))]
+    [InlineData(typeof(WatchlistController), nameof(WatchlistController.AddAliasAsync))]
+    [InlineData(typeof(WatchlistController), nameof(WatchlistController.DeleteAliasAsync))]
+    public void WriteEndpoints_RequireCronSecret(Type controller, string method)
+    {
+        var attribute = controller.GetMethod(method)!.GetCustomAttributes(typeof(RequireCronSecretAttribute), inherit: true);
+        Assert.Single(attribute);
     }
 
     [Fact]
     public async Task JobsController_Run_ReturnsBadRequest_WhenModeInvalid()
     {
-        await using var db = TestDbFactory.CreateInMemory();
-        var queue = new JobQueue();
-        var quota = new QuotaManager(db, NullLogger<QuotaManager>.Instance);
-        var controller = new JobsController(queue, quota, Options.Create(new CronOptions { SecretKey = "my-secret" }));
+        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()));
 
-        var result = await controller.RunAsync("invalid_mode", "my-secret");
+        var result = await controller.RunAsync("invalid_mode");
 
         Assert.IsType<BadRequestObjectResult>(result);
     }
@@ -42,15 +85,12 @@ public sealed class ControllersTests
     [InlineData("full")]
     [InlineData("transfers_news")]
     [InlineData("news")]
-    [InlineData("roster")]
+    [InlineData("ROSTER")]
     public async Task JobsController_Run_ReturnsAccepted_ForValidModes(string mode)
     {
-        await using var db = TestDbFactory.CreateInMemory();
-        var queue = new JobQueue();
-        var quota = new QuotaManager(db, NullLogger<QuotaManager>.Instance);
-        var controller = new JobsController(queue, quota, Options.Create(new CronOptions { SecretKey = "my-secret" }));
+        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()));
 
-        var result = await controller.RunAsync(mode, "my-secret");
+        var result = await controller.RunAsync(mode);
 
         Assert.IsType<AcceptedResult>(result);
     }
@@ -79,16 +119,55 @@ public sealed class ControllersTests
     public async Task WatchlistController_CrudAliases_WorksAndReturnsNotFoundForMissingId()
     {
         await using var db = TestDbFactory.CreateInMemory();
+        var team = new Team { ExternalApiId = 42, Name = "Arsenal" };
+        db.Teams.Add(team);
+        await db.SaveChangesAsync();
         var controller = new WatchlistController(db);
 
-        var created = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest("Team", 1, "Arsenal", "en"), CancellationToken.None);
+        var created = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest("team", team.Id, " Arsenal ", "EN"), CancellationToken.None);
         var createdResult = Assert.IsType<CreatedResult>(created);
         var alias = Assert.IsType<WatchlistAlias>(createdResult.Value);
+        Assert.Equal("Team", alias.EntityType);
+        Assert.Equal("Arsenal", alias.Keyword);
+        Assert.Equal("en", alias.Language);
+
+        var duplicate = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest("Team", team.Id, "arsenal", "en"), CancellationToken.None);
+        Assert.IsType<ConflictObjectResult>(duplicate);
 
         var deleteOk = await controller.DeleteAliasAsync(alias.Id, CancellationToken.None);
         Assert.IsType<NoContentResult>(deleteOk);
 
         var deleteMissing = await controller.DeleteAliasAsync(999, CancellationToken.None);
         Assert.IsType<NotFoundResult>(deleteMissing);
+    }
+
+    [Theory]
+    [InlineData("Coach", 1, "Arsenal", "en")]   // unknown entity type
+    [InlineData("Team", 999, "Arsenal", "en")]  // entity does not exist
+    [InlineData("Team", 1, "   ", "en")]        // empty keyword
+    [InlineData("Team", 1, "Arsenal", "fr")]    // unsupported language
+    public async Task WatchlistController_AddAlias_ReturnsBadRequest_ForInvalidInput(string type, int entityId, string keyword, string language)
+    {
+        await using var db = TestDbFactory.CreateInMemory();
+        db.Teams.Add(new Team { Id = 1, ExternalApiId = 42, Name = "Arsenal" });
+        await db.SaveChangesAsync();
+        var controller = new WatchlistController(db);
+
+        var result = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest(type, entityId, keyword, language), CancellationToken.None);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+    }
+
+    [Fact]
+    public async Task WatchlistController_AddTeam_ReturnsConflict_ForDuplicateExternalId()
+    {
+        await using var db = TestDbFactory.CreateInMemory();
+        var controller = new WatchlistController(db);
+
+        var first = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest(33, "Manchester United"), CancellationToken.None);
+        var second = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest(33, "Man Utd"), CancellationToken.None);
+
+        Assert.IsType<CreatedResult>(first);
+        Assert.IsType<ConflictObjectResult>(second);
     }
 }

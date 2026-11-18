@@ -1,35 +1,21 @@
-using System.Security.Cryptography;
-using System.Text;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Background;
-using PlayerInfo.Api.Configuration;
+using PlayerInfo.Api.Security;
 using PlayerInfo.Api.Services;
 
 namespace PlayerInfo.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-public sealed class JobsController(
-    JobQueue queue,
-    QuotaManager quota,
-    IOptions<CronOptions> cronOptions) : ControllerBase
+public sealed class JobsController(JobQueue queue, QuotaManager quota) : ControllerBase
 {
     /// <summary>
     /// Triggers the collector pipeline asynchronously and returns 202 Accepted immediately.
     /// </summary>
     [HttpPost("run")]
-    public async Task<IActionResult> RunAsync(
-        [FromQuery] string mode = "news",
-        [FromHeader(Name = "X-Cron-Secret")] string? secret = null,
-        CancellationToken ct = default)
+    [RequireCronSecret]
+    public async Task<IActionResult> RunAsync([FromQuery] string mode = "news", CancellationToken ct = default)
     {
-        var expected = cronOptions.Value.SecretKey;
-        if (!string.IsNullOrEmpty(expected) && !ConstantTimeEquals(secret, expected))
-        {
-            return Unauthorized(new { error = "Invalid X-Cron-Secret header." });
-        }
-
         if (!TryParseMode(mode, out var parsedMode))
         {
             return BadRequest(new { error = "Invalid mode. Allowed: full, transfers_news, news, roster." });
@@ -50,8 +36,8 @@ public sealed class JobsController(
     [HttpGet("quota")]
     public async Task<IActionResult> GetQuotaAsync(CancellationToken ct)
     {
-        var apiFootball = await quota.GetTodayUsageAsync("ApiFootball", ct);
-        var newsData = await quota.GetTodayUsageAsync("NewsData", ct);
+        var apiFootball = await quota.GetTodayUsageAsync(QuotaManager.ApiFootballProvider, ct);
+        var newsData = await quota.GetTodayUsageAsync(QuotaManager.NewsDataProvider, ct);
         return Ok(new
         {
             dateUtc = DateOnly.FromDateTime(DateTime.UtcNow),
@@ -60,28 +46,18 @@ public sealed class JobsController(
         });
     }
 
-    private static bool TryParseMode(string mode, out CollectorMode parsed)
+    private static bool TryParseMode(string? mode, out CollectorMode parsed)
     {
-        parsed = mode.Trim().ToLowerInvariant() switch
+        CollectorMode? result = mode?.Trim().ToLowerInvariant() switch
         {
             "full" => CollectorMode.Full,
             "transfers_news" => CollectorMode.TransfersNews,
             "news" => CollectorMode.News,
             "roster" => CollectorMode.Roster,
-            _ => (CollectorMode)(-1)
+            _ => null
         };
-        return Enum.IsDefined(parsed);
-    }
 
-    private static bool ConstantTimeEquals(string? a, string b)
-    {
-        if (string.IsNullOrEmpty(a))
-        {
-            return false;
-        }
-
-        return CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(a),
-            Encoding.UTF8.GetBytes(b));
+        parsed = result.GetValueOrDefault();
+        return result.HasValue;
     }
 }

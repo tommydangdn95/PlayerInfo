@@ -19,4 +19,8 @@
     <PackageReference Include="System.ServiceModel.Syndication" Version="9.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="PlayerInfo.UnitTests" />
+  </ItemGroup>
+
 </Project>

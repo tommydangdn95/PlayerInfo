@@ -5,7 +5,8 @@ Hệ thống tự động thu thập dữ liệu bóng đá (chấn thương, ch
 ## 1. Cấu trúc dự án
 
 - `src/PlayerInfo.Api`: ASP.NET Core 9 Web API + Background Queue (`Channel<JobRequest>`) + Clients (`ApiFootballClient`, `RssNewsClient`, `NewsDataClient`, `GeminiEnricherClient`, `TelegramNotifier`).
-- `tests/PlayerInfo.UnitTests`: Unit tests cho `Deduplicator` và `QuotaManager`.
+- `tests/PlayerInfo.UnitTests`: Unit tests cho clients, controllers, filter xác thực, `CollectorPipeline`, `Deduplicator`, `QuotaManager` và cấu hình.
+- Schema DB được quản lý bằng EF Core migrations (`src/PlayerInfo.Api/Data/Migrations`) và tự áp dụng khi app khởi động.
 - `Dockerfile`: Multi-stage build để deploy trực tiếp lên **Render Free Web Service**.
 
 ## 2. Biến môi trường cần cấu hình trên Render
@@ -14,8 +15,8 @@ Trong **Render Dashboard -> Web Service -> Environment Variables**, thêm các b
 
 | Biến môi trường | Mô tả |
 | :--- | :--- |
-| `ConnectionStrings__DefaultConnection` | Connection string từ **Neon** (có `SslMode=Require;`) |
-| `Cron__SecretKey` | Chuỗi bí mật tự đặt (dùng cho header `X-Cron-Secret`) |
+| `ConnectionStrings__DefaultConnection` | Connection string từ **Neon** (có `SslMode=Require;`, hoặc URI `postgresql://...`). **Bắt buộc** khi chạy production |
+| `Cron__SecretKey` | Chuỗi bí mật tự đặt (header `X-Cron-Secret`), bảo vệ `POST /api/jobs/run` và các API ghi của watchlist |
 | `ApiKeys__ApiFootball` | API Key từ `api-sports.io` (giới hạn 100 req/ngày, app tự chặn ở 90) |
 | `ApiKeys__NewsData` | API Key từ `newsdata.io` *(tùy chọn)* |
 | `ApiKeys__Gemini` | API Key từ Google AI Studio *(tùy chọn — dùng để tóm tắt & phân loại)* |
@@ -36,7 +37,7 @@ Với mỗi khung giờ, tạo 1 job ping đánh thức Render trước 2 phút 
 
 ## 4. Thêm đội bóng / từ khóa theo dõi
 
-Sau khi deploy (hoặc chạy local), gọi API để thêm CLB và từ khóa tìm kiếm:
+Sau khi deploy (hoặc chạy local), gọi API để thêm CLB và từ khóa tìm kiếm. Các request ghi cần header `X-Cron-Secret` (nếu đã đặt `Cron__SecretKey`). `entityId` của alias là `id` nội bộ trả về khi thêm đội, không phải id của API-Football:
 
 ```bash
 # 1. Thêm đội bóng (ExternalApiId lấy từ API-Football, VD: 33 = Manchester United)
@@ -56,3 +57,13 @@ POST /api/watchlist/aliases
 ```bash
 dotnet test -p:UseSharedCompilation=false -m:1
 ```
+
+## 6. Thay đổi schema
+
+Sau khi sửa entity hoặc `AppDbContext`:
+
+```bash
+dotnet ef migrations add <TenMigration> -p src/PlayerInfo.Api -o Data/Migrations
+```
+
+Migration được áp dụng tự động khi app khởi động.

@@ -1,4 +1,5 @@
 @PlayerInfo_HostAddress = http://localhost:5011
+@CronSecret = change-me
 
 ### 1. Health check
 GET {{PlayerInfo_HostAddress}}/api/health
@@ -7,6 +8,7 @@ Accept: application/json
 ### 2. Add tracked team (Manchester United)
 POST {{PlayerInfo_HostAddress}}/api/watchlist/teams
 Content-Type: application/json
+X-Cron-Secret: {{CronSecret}}
 
 {
   "externalApiId": 33,
@@ -18,6 +20,7 @@ Content-Type: application/json
 ### 3. Add search keyword alias
 POST {{PlayerInfo_HostAddress}}/api/watchlist/aliases
 Content-Type: application/json
+X-Cron-Secret: {{CronSecret}}
 
 {
   "entityType": "Team",
@@ -29,6 +32,7 @@ Content-Type: application/json
 ### 4. Trigger news collection
 POST {{PlayerInfo_HostAddress}}/api/jobs/run?mode=news
 Accept: application/json
+X-Cron-Secret: {{CronSecret}}
 
 ### 5. View collected news
 GET {{PlayerInfo_HostAddress}}/api/news?page=1&pageSize=20
