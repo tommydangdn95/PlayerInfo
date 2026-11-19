@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using PlayerInfo.Api.Data;
@@ -6,6 +7,7 @@ namespace PlayerInfo.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[AllowAnonymous]
 public sealed class HealthController(AppDbContext db) : ControllerBase
 {
     /// <summary>

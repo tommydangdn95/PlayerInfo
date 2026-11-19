@@ -1,76 +1,13 @@
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.Abstractions;
-using Microsoft.AspNetCore.Mvc.Filters;
-using Microsoft.AspNetCore.Routing;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Background;
-using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Controllers;
 using PlayerInfo.Api.Data.Entities;
-using PlayerInfo.Api.Security;
 using PlayerInfo.UnitTests.Helpers;
 
 namespace PlayerInfo.UnitTests;
 
 public sealed class ControllersTests
 {
-    private static AuthorizationFilterContext RunCronSecretFilter(string? configuredSecret, string? headerValue)
-    {
-        var services = new ServiceCollection()
-            .AddSingleton(Options.Create(new CronOptions { SecretKey = configuredSecret ?? string.Empty }))
-            .BuildServiceProvider();
-
-        var http = new DefaultHttpContext { RequestServices = services };
-        if (headerValue is not null)
-        {
-            http.Request.Headers[RequireCronSecretAttribute.HeaderName] = headerValue;
-        }
-
-        var context = new AuthorizationFilterContext(
-            new ActionContext(http, new RouteData(), new ActionDescriptor()),
-            new List<IFilterMetadata>());
-        new RequireCronSecretAttribute().OnAuthorization(context);
-        return context;
-    }
-
-    [Theory]
-    [InlineData("wrong-secret")]
-    [InlineData("my-secre")]
-    [InlineData("")]
-    [InlineData(null)]
-    public void RequireCronSecret_RejectsMissingOrWrongHeader(string? header)
-    {
-        var context = RunCronSecretFilter("my-secret", header);
-        Assert.IsType<UnauthorizedObjectResult>(context.Result);
-    }
-
-    [Fact]
-    public void RequireCronSecret_AllowsMatchingHeader()
-    {
-        var context = RunCronSecretFilter("my-secret", "my-secret");
-        Assert.Null(context.Result);
-    }
-
-    [Fact]
-    public void RequireCronSecret_AllowsAll_WhenNoSecretConfigured()
-    {
-        var context = RunCronSecretFilter(null, null);
-        Assert.Null(context.Result);
-    }
-
-    [Theory]
-    [InlineData(typeof(JobsController), nameof(JobsController.RunAsync))]
-    [InlineData(typeof(WatchlistController), nameof(WatchlistController.AddTeamAsync))]
-    [InlineData(typeof(WatchlistController), nameof(WatchlistController.AddAliasAsync))]
-    [InlineData(typeof(WatchlistController), nameof(WatchlistController.DeleteAliasAsync))]
-    public void WriteEndpoints_RequireCronSecret(Type controller, string method)
-    {
-        var attribute = controller.GetMethod(method)!.GetCustomAttributes(typeof(RequireCronSecretAttribute), inherit: true);
-        Assert.Single(attribute);
-    }
-
     [Fact]
     public async Task JobsController_Run_ReturnsBadRequest_WhenModeInvalid()
     {

@@ -6,3 +6,11 @@ obj/
 *.suo
 appsettings.Development.json
 .env
+
+# Local secrets (never commit)
+Secret.txt
+secret*.txt
+
+# Frontend
+node_modules/
+src/PlayerInfo.Api/wwwroot/

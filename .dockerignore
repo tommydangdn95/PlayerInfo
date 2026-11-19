@@ -6,3 +6,9 @@
 *.suo
 appsettings.Development.json
 .env
+
+Secret.txt
+secret*.txt
+
+**/node_modules/
+src/PlayerInfo.Api/wwwroot/

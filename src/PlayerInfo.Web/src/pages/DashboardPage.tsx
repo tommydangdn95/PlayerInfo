@@ -1,0 +1,145 @@
+import { useCallback, useEffect, useState } from 'react';
+import { api, errorMessage } from '../api';
+import { formatDateTime, type JobMode, type NewsPage, type Quota } from '../types';
+
+const JOBS: { mode: JobMode; label: string; hint: string }[] = [
+  { mode: 'news', label: 'Tin tức', hint: 'Thu thập tin + Gemini + Telegram. Không tốn quota API-Football.' },
+  { mode: 'transfers_news', label: 'Chuyển nhượng + tin', hint: 'Tốn 1 request API-Football cho mỗi đội đang theo dõi.' },
+  { mode: 'full', label: 'Đầy đủ', hint: 'Chấn thương, lịch đấu, chuyển nhượng, tin tức. Tốn nhiều quota nhất.' },
+  { mode: 'roster', label: 'Đội hình', hint: 'Cập nhật cầu thủ. Tốn 1 request cho mỗi đội.' },
+];
+
+export function DashboardPage() {
+  const [quota, setQuota] = useState<Quota | null>(null);
+  const [news, setNews] = useState<NewsPage | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<JobMode | null>(null);
+  const [jobMessage, setJobMessage] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const [q, n] = await Promise.all([
+        api<Quota>('/api/jobs/quota'),
+        api<NewsPage>('/api/news?page=1&pageSize=15'),
+      ]);
+      setQuota(q);
+      setNews(n);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function runJob(mode: JobMode) {
+    setConfirming(null);
+    setJobMessage(null);
+    try {
+      await api(`/api/jobs/run?mode=${mode}`, { method: 'POST' });
+      setJobMessage(`Đã đưa job "${mode}" vào hàng đợi. Bấm "Làm mới" sau 1–2 phút để xem kết quả.`);
+    } catch (err) {
+      setJobMessage(errorMessage(err));
+    }
+  }
+
+  return (
+    <div className="stack">
+      <div className="page-head">
+        <h2>Tổng quan</h2>
+        <button className="btn btn-ghost" onClick={() => void load()}>
+          Làm mới
+        </button>
+      </div>
+
+      {error && <div className="alert alert-error">{error}</div>}
+
+      <section className="grid-2">
+        <div className="card">
+          <h3>Quota hôm nay (UTC)</h3>
+          {quota ? (
+            <>
+              <QuotaBar label="API-Football" used={quota.apiFootball} limit={quota.apiFootballLimit} />
+              <QuotaBar label="NewsData.io" used={quota.newsData} limit={quota.newsDataLimit} />
+            </>
+          ) : (
+            <p className="muted">Đang tải…</p>
+          )}
+        </div>
+
+        <div className="card">
+          <h3>Chạy job ngay</h3>
+          <div className="job-list">
+            {JOBS.map((job) => (
+              <div key={job.mode} className="job-row">
+                <div>
+                  <strong>{job.label}</strong>
+                  <div className="muted small">{job.hint}</div>
+                </div>
+                {confirming === job.mode ? (
+                  <div className="row">
+                    <button className="btn btn-primary" onClick={() => void runJob(job.mode)}>
+                      Xác nhận
+                    </button>
+                    <button className="btn btn-ghost" onClick={() => setConfirming(null)}>
+                      Hủy
+                    </button>
+                  </div>
+                ) : (
+                  <button className="btn" onClick={() => setConfirming(job.mode)}>
+                    Chạy
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          {jobMessage && <div className="alert alert-info">{jobMessage}</div>}
+        </div>
+      </section>
+
+      <section className="card">
+        <h3>Tin mới nhất</h3>
+        {!news && <p className="muted">Đang tải…</p>}
+        {news && news.items.length === 0 && (
+          <p className="muted">Chưa có tin. Thêm đội ở mục "Đội bóng" rồi chạy job "Tin tức".</p>
+        )}
+        <ul className="news-list">
+          {news?.items.map((item) => (
+            <li key={item.id}>
+              <div className="news-meta">
+                <span className={`tag tag-${item.category.toLowerCase()}`}>{item.category}</span>
+                <span className="muted small">
+                  {item.sourceName} · {formatDateTime(item.publishedAtUtc)}
+                </span>
+              </div>
+              <a href={item.url} target="_blank" rel="noreferrer noopener">
+                {item.title}
+              </a>
+              {item.summaryVi && <p className="summary">{item.summaryVi}</p>}
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
+  );
+}
+
+function QuotaBar({ label, used, limit }: { label: string; used: number; limit: number }) {
+  const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  const level = pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : 'ok';
+  return (
+    <div className="quota">
+      <div className="quota-label">
+        <span>{label}</span>
+        <span>
+          {used} / {limit}
+        </span>
+      </div>
+      <div className="quota-track">
+        <div className={`quota-fill quota-${level}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}

@@ -1,5 +1,8 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Background;
+using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Security;
 using PlayerInfo.Api.Services;
 
@@ -13,7 +16,7 @@ public sealed class JobsController(JobQueue queue, QuotaManager quota) : Control
     /// Triggers the collector pipeline asynchronously and returns 202 Accepted immediately.
     /// </summary>
     [HttpPost("run")]
-    [RequireCronSecret]
+    [Authorize(Policy = Policies.AdminOrCron)]
     public async Task<IActionResult> RunAsync([FromQuery] string mode = "news", CancellationToken ct = default)
     {
         if (!TryParseMode(mode, out var parsedMode))
@@ -34,7 +37,9 @@ public sealed class JobsController(JobQueue queue, QuotaManager quota) : Control
     /// Returns today's API request usage from ApiQuotaLogs.
     /// </summary>
     [HttpGet("quota")]
-    public async Task<IActionResult> GetQuotaAsync(CancellationToken ct)
+    public async Task<IActionResult> GetQuotaAsync(
+        [FromServices] IOptions<CollectorOptions> options,
+        CancellationToken ct)
     {
         var apiFootball = await quota.GetTodayUsageAsync(QuotaManager.ApiFootballProvider, ct);
         var newsData = await quota.GetTodayUsageAsync(QuotaManager.NewsDataProvider, ct);
@@ -42,7 +47,9 @@ public sealed class JobsController(JobQueue queue, QuotaManager quota) : Control
         {
             dateUtc = DateOnly.FromDateTime(DateTime.UtcNow),
             apiFootball,
-            newsData
+            newsData,
+            apiFootballLimit = options.Value.ApiFootballDailyLimit,
+            newsDataLimit = options.Value.NewsDataDailyLimit
         });
     }
 

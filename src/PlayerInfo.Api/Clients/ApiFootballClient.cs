@@ -51,6 +51,14 @@ public sealed class ApiFootballClient(
         return resp ?? [];
     }
 
+    /// <summary>Searches teams by name (API-Football requires at least 3 characters). Costs 1 request.</summary>
+    public async Task<IReadOnlyList<ApiFootballTeamSearchItem>> SearchTeamsAsync(
+        string name, CancellationToken ct = default)
+    {
+        var resp = await SendAsync<ApiFootballTeamSearchItem>($"teams?search={Uri.EscapeDataString(name)}", ct);
+        return resp ?? [];
+    }
+
     private async Task<List<T>?> SendAsync<T>(string relativeUrl, CancellationToken ct)
     {
         var key = apiKeys.Value.ApiFootball;
@@ -147,5 +155,9 @@ public sealed record ApiFootballTransferTeams(ApiFootballNamedEntity In, ApiFoot
 public sealed record ApiFootballSquadEnvelope(
     ApiFootballNamedEntity Team,
     List<ApiFootballSquadPlayer> Players);
+
+public sealed record ApiFootballTeamSearchItem(ApiFootballTeamInfo Team);
+
+public sealed record ApiFootballTeamInfo(int Id, string Name, string? Country, int? Founded, bool National, string? Logo);
 
 public sealed record ApiFootballSquadPlayer(int Id, string Name, int? Number, string? Position, string? Photo);
