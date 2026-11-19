@@ -2,6 +2,7 @@ import { Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-rou
 import { useAuth } from './auth';
 import { DashboardPage } from './pages/DashboardPage';
 import { LoginPage } from './pages/LoginPage';
+import { LogsPage } from './pages/LogsPage';
 import { TeamsPage } from './pages/TeamsPage';
 
 function RequireAuth() {
@@ -24,6 +25,7 @@ function Layout() {
             Tổng quan
           </NavLink>
           <NavLink to="/teams">Đội bóng</NavLink>
+          <NavLink to="/logs">Nhật ký</NavLink>
         </nav>
         <div className="user">
           <span>{session?.username}</span>
@@ -46,6 +48,7 @@ export function App() {
       <Route element={<RequireAuth />}>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/teams" element={<TeamsPage />} />
+        <Route path="/logs" element={<LogsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

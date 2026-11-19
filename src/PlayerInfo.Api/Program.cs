@@ -5,6 +5,7 @@ using PlayerInfo.Api.Background;
 using PlayerInfo.Api.Clients;
 using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Data;
+using PlayerInfo.Api.Logging;
 using PlayerInfo.Api.Security;
 using PlayerInfo.Api.Services;
 
@@ -16,6 +17,11 @@ if (args is ["hash-password", var plainPassword])
 }
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Live log for the admin UI (in memory only): the app's own logs, Information and above.
+var liveLog = new LiveLogBuffer();
+builder.Services.AddSingleton(liveLog);
+builder.Logging.AddProvider(new LiveLogLoggerProvider(liveLog));
 
 var renderPort = Environment.GetEnvironmentVariable("PORT");
 if (!string.IsNullOrWhiteSpace(renderPort))
@@ -60,7 +66,7 @@ builder.Services.AddScoped(sp => sp.GetRequiredService<IDbContextFactory<AppDbCo
 
 // ---------------------------------------------------------------- HTTP clients
 // Quota-guarded providers: no automatic retries, because every attempt costs a request
-// the QuotaManager would not see.
+// the QuotaManager would not see. API-Football is only used for transfers.
 builder.Services.AddHttpClient<ApiFootballClient>(c => c.BaseAddress = new Uri("https://v3.api-sports.io/"))
     .AddStandardResilienceHandler(DisableRetries);
 
@@ -68,6 +74,11 @@ builder.Services.AddHttpClient<NewsDataClient>(c => c.BaseAddress = new Uri("htt
     .AddStandardResilienceHandler(DisableRetries);
 
 builder.Services.AddHttpClient<RssNewsClient>()
+    .AddStandardResilienceHandler();
+
+// ESPN public API: no key and no quota, so the default retries are fine. Keep the default
+// User-Agent: ESPN's CDN rejects agents containing "bot".
+builder.Services.AddHttpClient<EspnClient>(c => c.BaseAddress = new Uri(EspnClient.BaseUrl))
     .AddStandardResilienceHandler();
 
 // Gemini: a batch of 15 summaries can take well over the default 10s attempt timeout.
@@ -89,6 +100,15 @@ builder.Services.AddHttpClient<GeminiEnricherClient>(c =>
 // An undelivered digest is not marked notified, so the next run sends it instead.
 builder.Services.AddHttpClient<TelegramNotifier>()
     .AddStandardResilienceHandler(DisableRetries);
+
+// Trace every outbound call into the live log. Registered after the resilience handlers above,
+// so the trace handler sits inside them and each retry attempt is recorded separately.
+builder.Services.AddHttpClient<ApiFootballClient>().AddLiveTrace("API-Football");
+builder.Services.AddHttpClient<NewsDataClient>().AddLiveTrace("NewsData");
+builder.Services.AddHttpClient<RssNewsClient>().AddLiveTrace("RSS");
+builder.Services.AddHttpClient<EspnClient>().AddLiveTrace("ESPN");
+builder.Services.AddHttpClient<GeminiEnricherClient>().AddLiveTrace("Gemini");
+builder.Services.AddHttpClient<TelegramNotifier>().AddLiveTrace("Telegram");
 
 builder.Services.AddScoped<QuotaManager>();
 builder.Services.AddScoped<CollectorPipeline>();

@@ -19,13 +19,18 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     {
         modelBuilder.Entity<Team>(e =>
         {
-            e.HasIndex(x => x.ExternalApiId).IsUnique();
+            // Unique ids; PostgreSQL allows several NULLs in a unique index.
+            e.HasIndex(x => x.EspnId).IsUnique();
+            e.HasIndex(x => x.ApiFootballId).IsUnique();
+            e.Property(x => x.EspnId).HasMaxLength(20);
+            e.Property(x => x.LeagueSlug).HasMaxLength(50);
             e.Property(x => x.Name).HasMaxLength(200);
         });
 
         modelBuilder.Entity<Player>(e =>
         {
-            e.HasIndex(x => x.ExternalApiId).IsUnique();
+            e.HasIndex(x => x.EspnId).IsUnique();
+            e.Property(x => x.EspnId).HasMaxLength(20);
             e.Property(x => x.FullName).HasMaxLength(200);
             e.HasOne(x => x.Team)
                 .WithMany(t => t.Players)
@@ -63,7 +68,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 
         modelBuilder.Entity<PlayerInjury>(e =>
         {
-            e.HasIndex(x => new { x.PlayerExternalId, x.ReportedDateUtc });
+            e.HasIndex(x => new { x.PlayerEspnId, x.ReportedDateUtc });
+            e.Property(x => x.PlayerEspnId).HasMaxLength(20);
+            e.Property(x => x.TeamEspnId).HasMaxLength(20);
             e.Property(x => x.PlayerName).HasMaxLength(200);
             e.Property(x => x.TeamName).HasMaxLength(200);
         });
@@ -76,8 +83,13 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 
         modelBuilder.Entity<Fixture>(e =>
         {
-            e.HasIndex(x => x.ExternalFixtureId).IsUnique();
+            e.HasIndex(x => x.EspnEventId).IsUnique();
             e.HasIndex(x => x.KickoffAtUtc);
+            e.Property(x => x.EspnEventId).HasMaxLength(20);
+            e.Property(x => x.LeagueSlug).HasMaxLength(50);
+            e.Property(x => x.HomeTeamEspnId).HasMaxLength(20);
+            e.Property(x => x.AwayTeamEspnId).HasMaxLength(20);
+            e.Property(x => x.StatusShort).HasMaxLength(50);
         });
 
         modelBuilder.Entity<ApiQuotaLog>(e =>

@@ -1,9 +1,14 @@
 using System.Threading.Channels;
+using PlayerInfo.Api.Logging;
 using PlayerInfo.Api.Services;
 
 namespace PlayerInfo.Api.Background;
 
-public sealed record JobRequest(CollectorMode Mode, DateTime RequestedAtUtc);
+/// <param name="JobId">Short id shown in the live log; generated when the job is queued.</param>
+public sealed record JobRequest(CollectorMode Mode, DateTime RequestedAtUtc, string? JobId = null)
+{
+    public static string NewJobId() => Guid.NewGuid().ToString("N")[..8];
+}
 
 /// <summary>
 /// Bounded channel queue + BackgroundService so cron triggers return 202 Accepted immediately.
@@ -31,6 +36,8 @@ public sealed class JobRunnerService(
     {
         await foreach (var job in queue.DequeueAllAsync(stoppingToken))
         {
+            // Every log line written while this job runs is tagged with its id in the live log.
+            using var jobScope = JobLogContext.Begin(job.JobId ?? JobRequest.NewJobId(), job.Mode.ToString());
             try
             {
                 using var scope = scopeFactory.CreateScope();

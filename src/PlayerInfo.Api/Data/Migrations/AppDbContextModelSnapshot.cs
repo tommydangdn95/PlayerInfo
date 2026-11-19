@@ -77,15 +77,25 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Property<int?>("AwayGoals")
                         .HasColumnType("integer");
 
+                    b.Property<string>("AwayTeamEspnId")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
                     b.Property<string>("AwayTeamName")
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.Property<int>("ExternalFixtureId")
-                        .HasColumnType("integer");
+                    b.Property<string>("EspnEventId")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<int?>("HomeGoals")
                         .HasColumnType("integer");
+
+                    b.Property<string>("HomeTeamEspnId")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<string>("HomeTeamName")
                         .IsRequired()
@@ -94,23 +104,26 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Property<DateTime>("KickoffAtUtc")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<int>("LeagueExternalId")
-                        .HasColumnType("integer");
-
                     b.Property<string>("LeagueName")
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<string>("LeagueSlug")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
                     b.Property<string>("StatusShort")
                         .IsRequired()
-                        .HasColumnType("text");
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
 
                     b.Property<DateTime>("UpdatedAtUtc")
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ExternalFixtureId")
+                    b.HasIndex("EspnEventId")
                         .IsUnique();
 
                     b.HasIndex("KickoffAtUtc");
@@ -193,8 +206,10 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
 
-                    b.Property<int>("ExternalApiId")
-                        .HasColumnType("integer");
+                    b.Property<string>("EspnId")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<string>("FullName")
                         .IsRequired()
@@ -221,7 +236,7 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ExternalApiId")
+                    b.HasIndex("EspnId")
                         .IsUnique();
 
                     b.HasIndex("TeamId");
@@ -240,8 +255,10 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Property<DateTime>("FetchedAtUtc")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<int>("PlayerExternalId")
-                        .HasColumnType("integer");
+                    b.Property<string>("PlayerEspnId")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<string>("PlayerName")
                         .IsRequired()
@@ -255,8 +272,10 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Property<DateTime>("ReportedDateUtc")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<int>("TeamExternalId")
-                        .HasColumnType("integer");
+                    b.Property<string>("TeamEspnId")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<string>("TeamName")
                         .IsRequired()
@@ -268,7 +287,7 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("PlayerExternalId", "ReportedDateUtc");
+                    b.HasIndex("PlayerEspnId", "ReportedDateUtc");
 
                     b.ToTable("PlayerInjuries");
                 });
@@ -327,17 +346,22 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
 
+                    b.Property<int?>("ApiFootballId")
+                        .HasColumnType("integer");
+
                     b.Property<string>("Country")
                         .HasColumnType("text");
 
-                    b.Property<int>("ExternalApiId")
-                        .HasColumnType("integer");
+                    b.Property<string>("EspnId")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
 
                     b.Property<bool>("IsTracked")
                         .HasColumnType("boolean");
 
-                    b.Property<int?>("LeagueExternalId")
-                        .HasColumnType("integer");
+                    b.Property<string>("LeagueSlug")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
 
                     b.Property<string>("LogoUrl")
                         .HasColumnType("text");
@@ -352,7 +376,10 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ExternalApiId")
+                    b.HasIndex("ApiFootballId")
+                        .IsUnique();
+
+                    b.HasIndex("EspnId")
                         .IsUnique();
 
                     b.ToTable("Teams");

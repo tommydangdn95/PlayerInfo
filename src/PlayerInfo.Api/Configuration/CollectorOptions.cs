@@ -26,7 +26,18 @@ public sealed class CollectorOptions
 {
     public const string SectionName = "Collector";
 
-    public static readonly IReadOnlyList<int> DefaultTrackedLeagueIds = [39, 140, 135, 78, 2];
+    /// <summary>ESPN league slugs (same set as the FootballNews project).</summary>
+    public static readonly IReadOnlyList<LeagueOption> DefaultLeagues =
+    [
+        new("eng.1", "Premier League"),
+        new("esp.1", "La Liga"),
+        new("ita.1", "Serie A"),
+        new("ger.1", "Bundesliga"),
+        new("fra.1", "Ligue 1"),
+        new("uefa.champions", "Champions League"),
+        new("uefa.europa", "Europa League"),
+        new("uefa.europa.conf", "Conference League")
+    ];
 
     public static readonly IReadOnlyList<RssFeedSource> DefaultSportsRssFeeds =
     [
@@ -36,7 +47,7 @@ public sealed class CollectorOptions
     ];
 
     /// <summary>
-    /// Daily safety cap for API-Football (free tier is 100/day).
+    /// Daily safety cap for API-Football (free tier is 100/day). Only transfers use API-Football.
     /// </summary>
     public int ApiFootballDailyLimit { get; set; } = 90;
 
@@ -46,20 +57,15 @@ public sealed class CollectorOptions
     public int NewsDataDailyLimit { get; set; } = 180;
 
     /// <summary>
-    /// League IDs in API-Football to sync injuries/fixtures (e.g., 39=EPL, 140=LaLiga, 2=UCL).
+    /// ESPN leagues whose fixtures are synced and whose teams can be picked in the admin UI.
     /// Starts empty on purpose: the configuration binder appends to (rather than replaces) an
     /// initialized list, so defaults are applied in <see cref="ApplyDefaults"/> after binding.
     /// </summary>
-    public List<int> TrackedLeagueIds { get; set; } = [];
-
-    /// <summary>
-    /// Current football season year (e.g., 2026).
-    /// </summary>
-    public int CurrentSeason { get; set; } = 2026;
+    public List<LeagueOption> Leagues { get; set; } = [];
 
     /// <summary>
     /// Trusted sports RSS feeds to ingest alongside Google News RSS. Same binding caveat as
-    /// <see cref="TrackedLeagueIds"/>.
+    /// <see cref="Leagues"/>.
     /// </summary>
     public List<RssFeedSource> SportsRssFeeds { get; set; } = [];
 
@@ -71,9 +77,13 @@ public sealed class CollectorOptions
     /// </summary>
     public void ApplyDefaults()
     {
-        TrackedLeagueIds = TrackedLeagueIds.Count == 0
-            ? [.. DefaultTrackedLeagueIds]
-            : TrackedLeagueIds.Distinct().ToList();
+        Leagues = Leagues.Count == 0
+            ? [.. DefaultLeagues]
+            : Leagues
+                .Where(l => !string.IsNullOrWhiteSpace(l.Slug))
+                .Select(l => l with { Slug = l.Slug.Trim().ToLowerInvariant(), Name = string.IsNullOrWhiteSpace(l.Name) ? l.Slug.Trim() : l.Name.Trim() })
+                .DistinctBy(l => l.Slug)
+                .ToList();
 
         SportsRssFeeds = SportsRssFeeds.Count == 0
             ? [.. DefaultSportsRssFeeds]
@@ -87,3 +97,6 @@ public sealed class CollectorOptions
 }
 
 public sealed record RssFeedSource(string Name, string Url, string Language);
+
+/// <summary>An ESPN soccer league, e.g. ("eng.1", "Premier League").</summary>
+public sealed record LeagueOption(string Slug, string Name);

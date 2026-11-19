@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, errorMessage } from '../api';
 import { formatDateTime, type JobMode, type NewsPage, type Quota } from '../types';
 
 const JOBS: { mode: JobMode; label: string; hint: string }[] = [
-  { mode: 'news', label: 'Tin tức', hint: 'Thu thập tin + Gemini + Telegram. Không tốn quota API-Football.' },
-  { mode: 'transfers_news', label: 'Chuyển nhượng + tin', hint: 'Tốn 1 request API-Football cho mỗi đội đang theo dõi.' },
-  { mode: 'full', label: 'Đầy đủ', hint: 'Chấn thương, lịch đấu, chuyển nhượng, tin tức. Tốn nhiều quota nhất.' },
-  { mode: 'roster', label: 'Đội hình', hint: 'Cập nhật cầu thủ. Tốn 1 request cho mỗi đội.' },
+  { mode: 'news', label: 'Tin tức', hint: 'Tin ESPN, Google News, RSS + Gemini + Telegram. Không tốn quota API-Football.' },
+  { mode: 'transfers_news', label: 'Chuyển nhượng + tin', hint: 'Tốn 1 request API-Football cho mỗi đội đã liên kết API-Football.' },
+  { mode: 'full', label: 'Đầy đủ', hint: 'Chấn thương, lịch đấu (ESPN), chuyển nhượng (API-Football), tin tức.' },
+  { mode: 'roster', label: 'Đội hình', hint: 'Cập nhật cầu thủ từ ESPN. Không tốn quota.' },
 ];
 
 export function DashboardPage() {
@@ -15,6 +16,7 @@ export function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<JobMode | null>(null);
   const [jobMessage, setJobMessage] = useState<string | null>(null);
+  const [lastJobId, setLastJobId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -38,9 +40,11 @@ export function DashboardPage() {
     setConfirming(null);
     setJobMessage(null);
     try {
-      await api(`/api/jobs/run?mode=${mode}`, { method: 'POST' });
-      setJobMessage(`Đã đưa job "${mode}" vào hàng đợi. Bấm "Làm mới" sau 1–2 phút để xem kết quả.`);
+      const result = await api<{ jobId: string }>(`/api/jobs/run?mode=${mode}`, { method: 'POST' });
+      setLastJobId(result.jobId);
+      setJobMessage(`Đã đưa job "${mode}" (${result.jobId}) vào hàng đợi.`);
     } catch (err) {
+      setLastJobId(null);
       setJobMessage(errorMessage(err));
     }
   }
@@ -95,7 +99,12 @@ export function DashboardPage() {
               </div>
             ))}
           </div>
-          {jobMessage && <div className="alert alert-info">{jobMessage}</div>}
+          {jobMessage && (
+            <div className="alert alert-info">
+              {jobMessage}{' '}
+              {lastJobId && <Link to={`/logs?job=${lastJobId}`}>Xem nhật ký trực tiếp →</Link>}
+            </div>
+          )}
         </div>
       </section>
 

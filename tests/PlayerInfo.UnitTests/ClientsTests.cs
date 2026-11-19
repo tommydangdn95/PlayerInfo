@@ -132,9 +132,9 @@ public sealed class ClientsTests
             Options.Create(new CollectorOptions { ApiFootballDailyLimit = 90 }),
             NullLogger<ApiFootballClient>.Instance);
 
-        var injuries = await client.GetInjuriesByLeagueAsync(39, 2026);
+        var transfers = await client.GetTransfersByTeamAsync(42);
 
-        Assert.Empty(injuries);
+        Assert.Empty(transfers);
         Assert.Empty(handler.Requests);
     }
 
@@ -154,8 +154,8 @@ public sealed class ClientsTests
             Options.Create(new CollectorOptions()),
             NullLogger<ApiFootballClient>.Instance);
 
-        Assert.Empty(await client.GetInjuriesByLeagueAsync(39, 2026));
-        Assert.Empty(await client.GetInjuriesByLeagueAsync(39, 2026));
+        Assert.Empty(await client.GetTransfersByTeamAsync(42));
+        Assert.Empty(await client.GetTransfersByTeamAsync(42));
         Assert.Equal(2, await quota.GetTodayUsageAsync("ApiFootball"));
     }
 
@@ -196,9 +196,12 @@ public sealed class ClientsTests
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Collector:TrackedLeagueIds:0"] = "39",
-                ["Collector:TrackedLeagueIds:1"] = "140",
-                ["Collector:TrackedLeagueIds:2"] = "39",
+                ["Collector:Leagues:0:Slug"] = "eng.1",
+                ["Collector:Leagues:0:Name"] = "Premier League",
+                ["Collector:Leagues:1:Slug"] = " ESP.1 ",
+                ["Collector:Leagues:1:Name"] = "La Liga",
+                ["Collector:Leagues:2:Slug"] = "eng.1",
+                ["Collector:Leagues:2:Name"] = "Duplicate",
                 ["Collector:SportsRssFeeds:0:Name"] = "BBC Sport",
                 ["Collector:SportsRssFeeds:0:Url"] = "https://feeds.bbci.co.uk/sport/football/rss.xml",
                 ["Collector:SportsRssFeeds:0:Language"] = "en"
@@ -210,7 +213,7 @@ public sealed class ClientsTests
             .Services.BuildServiceProvider()
             .GetRequiredService<IOptions<CollectorOptions>>().Value;
 
-        Assert.Equal([39, 140], options.TrackedLeagueIds);
+        Assert.Equal(["eng.1", "esp.1"], options.Leagues.Select(l => l.Slug));
         Assert.Equal("BBC Sport", Assert.Single(options.SportsRssFeeds).Name);
     }
 
@@ -220,7 +223,8 @@ public sealed class ClientsTests
         var options = new CollectorOptions();
         options.ApplyDefaults();
 
-        Assert.Equal(CollectorOptions.DefaultTrackedLeagueIds, options.TrackedLeagueIds);
+        Assert.Equal(8, options.Leagues.Count);
+        Assert.Contains(options.Leagues, l => l.Slug == "uefa.champions");
         Assert.Equal(CollectorOptions.DefaultSportsRssFeeds.Count, options.SportsRssFeeds.Count);
     }
 }

@@ -33,7 +33,7 @@ public sealed class QuotaManagerTests
     {
         var dbName = Guid.NewGuid().ToString();
         await using var pipelineDb = TestDbFactory.CreateInMemory(dbName);
-        pipelineDb.Teams.Add(new PlayerInfo.Api.Data.Entities.Team { ExternalApiId = 1, Name = "Pending" });
+        pipelineDb.Teams.Add(new PlayerInfo.Api.Data.Entities.Team { EspnId = "1", Name = "Pending" });
 
         await TestDbFactory.CreateQuotaManager(dbName).IncrementAsync("ApiFootball");
 

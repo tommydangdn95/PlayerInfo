@@ -22,6 +22,7 @@ public enum CollectorMode
 /// </summary>
 public sealed class CollectorPipeline(
     AppDbContext db,
+    EspnClient espn,
     ApiFootballClient apiFootball,
     RssNewsClient rssNews,
     NewsDataClient newsData,
@@ -38,6 +39,12 @@ public sealed class CollectorPipeline(
 
     /// <summary>How far back stored headlines are compared for title-based deduplication.</summary>
     public static readonly TimeSpan TitleDedupWindow = TimeSpan.FromDays(3);
+
+    /// <summary>An undated ESPN injury with the same reason within this window is treated as the same injury.</summary>
+    public static readonly TimeSpan OngoingInjuryWindow = TimeSpan.FromDays(30);
+
+    /// <summary>ESPN articles requested per tracked team and run.</summary>
+    public const int EspnNewsPerTeam = 10;
 
     private delegate Task Step(CancellationToken ct);
 
@@ -106,108 +113,139 @@ public sealed class CollectorPipeline(
 
     // ---------------------------------------------------------------- Football data
 
+    /// <summary>Tracked teams linked to ESPN (team id + league): the unit for roster, injury and news calls.</summary>
+    private Task<List<Team>> GetEspnTrackedTeamsAsync(CancellationToken ct)
+        => db.Teams
+            .AsNoTracking()
+            .Where(t => t.IsTracked && t.EspnId != null && t.LeagueSlug != null)
+            .OrderBy(t => t.Id)
+            .ToListAsync(ct);
+
+    /// <summary>Injuries of tracked teams' players, from the ESPN roster (no key, no quota).</summary>
     private async Task SyncInjuriesAsync(CancellationToken ct)
     {
-        var cfg = options.Value;
-        foreach (var leagueId in cfg.TrackedLeagueIds)
+        var today = DateTime.SpecifyKind(DateTime.UtcNow.Date, DateTimeKind.Utc);
+
+        foreach (var team in await GetEspnTrackedTeamsAsync(ct))
         {
-            var injuries = await apiFootball.GetInjuriesByLeagueAsync(leagueId, cfg.CurrentSeason, ct);
-            if (injuries.Count == 0)
+            var injured = (await espn.GetRosterAsync(team.LeagueSlug!, team.EspnId!, ct))
+                .Where(a => a.Injuries.Count > 0)
+                .ToList();
+            if (injured.Count == 0)
             {
                 continue;
             }
 
-            var playerIds = injuries.Select(i => i.Player.Id).Distinct().ToList();
+            var playerIds = injured.Select(a => a.Id).ToList();
             var existing = await db.PlayerInjuries
                 .AsNoTracking()
-                .Where(x => playerIds.Contains(x.PlayerExternalId))
-                .Select(x => new { x.PlayerExternalId, x.ReportedDateUtc })
+                .Where(x => playerIds.Contains(x.PlayerEspnId))
+                .Select(x => new { x.PlayerEspnId, x.Reason, x.ReportedDateUtc })
                 .ToListAsync(ct);
-            var seen = existing.Select(x => (x.PlayerExternalId, x.ReportedDateUtc)).ToHashSet();
+            var seenByDate = existing.Select(x => (x.PlayerEspnId, x.ReportedDateUtc)).ToHashSet();
+            var recentReasons = existing
+                .Where(x => x.ReportedDateUtc >= today - OngoingInjuryWindow)
+                .Select(x => (x.PlayerEspnId, x.Reason.ToLowerInvariant()))
+                .ToHashSet();
 
             var added = 0;
-            foreach (var item in injuries)
+            foreach (var athlete in injured)
             {
-                var reportedDate = DateTime.SpecifyKind(item.Fixture.Date.UtcDateTime.Date, DateTimeKind.Utc);
-                if (!seen.Add((item.Player.Id, reportedDate)))
+                foreach (var injury in athlete.Injuries)
                 {
-                    continue;
-                }
+                    // Without a date from ESPN, an injury still listed tomorrow is the same injury, not a new one.
+                    if (injury.DateUtc is null && recentReasons.Contains((athlete.Id, injury.Reason.ToLowerInvariant())))
+                    {
+                        continue;
+                    }
 
-                db.PlayerInjuries.Add(new PlayerInjury
-                {
-                    PlayerExternalId = item.Player.Id,
-                    PlayerName = item.Player.Name,
-                    TeamExternalId = item.Team.Id,
-                    TeamName = item.Team.Name,
-                    Reason = item.Injury?.Reason ?? "Unknown",
-                    Type = item.Injury?.Type,
-                    ReportedDateUtc = reportedDate
-                });
-                added++;
+                    var reported = DateTime.SpecifyKind((injury.DateUtc ?? today).Date, DateTimeKind.Utc);
+                    if (!seenByDate.Add((athlete.Id, reported)))
+                    {
+                        continue;
+                    }
+
+                    recentReasons.Add((athlete.Id, injury.Reason.ToLowerInvariant()));
+                    db.PlayerInjuries.Add(new PlayerInjury
+                    {
+                        PlayerEspnId = athlete.Id,
+                        PlayerName = athlete.Name,
+                        TeamEspnId = team.EspnId!,
+                        TeamName = team.Name,
+                        Reason = injury.Reason,
+                        Type = injury.Status,
+                        ReportedDateUtc = reported
+                    });
+                    added++;
+                }
             }
 
             await db.SaveChangesAsync(ct);
-            logger.LogInformation("League {LeagueId}: {Added} new injuries", leagueId, added);
+            logger.LogInformation("{Team}: {Added} new injuries", team.Name, added);
         }
     }
 
+    /// <summary>Results and upcoming matches of the configured leagues, from the ESPN scoreboard.</summary>
     private async Task SyncFixturesAsync(CancellationToken ct)
     {
-        var trackedLeagues = options.Value.TrackedLeagueIds.ToHashSet();
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        // ESPN dates are US dates: yesterday..tomorrow covers last night's results and today's games in UTC / VN time.
+        var dates = new[] { today.AddDays(-1), today, today.AddDays(1) };
 
-        foreach (var date in new[] { today.AddDays(-1), today })
+        foreach (var league in options.Value.Leagues)
         {
-            var fixtures = (await apiFootball.GetFixturesByDateAsync(date, ct))
-                .Where(x => trackedLeagues.Contains(x.League.Id))
-                .DistinctBy(x => x.Fixture.Id)
-                .ToList();
-            if (fixtures.Count == 0)
+            var matches = new List<EspnMatch>();
+            foreach (var date in dates)
+            {
+                matches.AddRange(await espn.GetScoreboardAsync(league.Slug, date, ct));
+            }
+
+            var distinct = matches.DistinctBy(m => m.EventId).ToList();
+            if (distinct.Count == 0)
             {
                 continue;
             }
 
-            var ids = fixtures.Select(f => f.Fixture.Id).ToList();
+            var ids = distinct.Select(m => m.EventId).ToList();
             var existing = await db.Fixtures
-                .Where(x => ids.Contains(x.ExternalFixtureId))
-                .ToDictionaryAsync(x => x.ExternalFixtureId, ct);
+                .Where(x => ids.Contains(x.EspnEventId))
+                .ToDictionaryAsync(x => x.EspnEventId, ct);
 
-            foreach (var f in fixtures)
+            foreach (var m in distinct)
             {
-                if (existing.TryGetValue(f.Fixture.Id, out var row))
+                if (!existing.TryGetValue(m.EventId, out var row))
                 {
-                    row.HomeGoals = f.Goals.Home;
-                    row.AwayGoals = f.Goals.Away;
-                    row.StatusShort = f.Fixture.Status.Short;
-                    row.KickoffAtUtc = f.Fixture.Date.UtcDateTime;
-                    row.UpdatedAtUtc = DateTime.UtcNow;
-                    continue;
+                    row = new Fixture { EspnEventId = m.EventId };
+                    db.Fixtures.Add(row);
                 }
 
-                db.Fixtures.Add(new Fixture
-                {
-                    ExternalFixtureId = f.Fixture.Id,
-                    LeagueExternalId = f.League.Id,
-                    LeagueName = f.League.Name,
-                    HomeTeamName = f.Teams.Home.Name,
-                    AwayTeamName = f.Teams.Away.Name,
-                    HomeGoals = f.Goals.Home,
-                    AwayGoals = f.Goals.Away,
-                    StatusShort = f.Fixture.Status.Short,
-                    KickoffAtUtc = f.Fixture.Date.UtcDateTime
-                });
+                row.LeagueSlug = league.Slug;
+                row.LeagueName = league.Name;
+                row.HomeTeamEspnId = m.HomeTeamId;
+                row.HomeTeamName = m.HomeTeamName;
+                row.AwayTeamEspnId = m.AwayTeamId;
+                row.AwayTeamName = m.AwayTeamName;
+                row.HomeGoals = m.HomeScore;
+                row.AwayGoals = m.AwayScore;
+                row.StatusShort = m.StatusName;
+                row.KickoffAtUtc = m.KickoffUtc;
+                row.UpdatedAtUtc = DateTime.UtcNow;
             }
 
             await db.SaveChangesAsync(ct);
+            logger.LogInformation("{League}: {Count} fixtures synced ({New} new)", league.Slug, distinct.Count, distinct.Count - existing.Count);
         }
     }
 
+    /// <summary>
+    /// Recent transfers from API-Football (quota-guarded), only for tracked teams that have an
+    /// API-Football id. ESPN has no transfer feed.
+    /// </summary>
     private async Task SyncTransfersAsync(CancellationToken ct)
     {
         var trackedTeams = await db.Teams
             .AsNoTracking()
-            .Where(t => t.IsTracked && t.ExternalApiId > 0)
+            .Where(t => t.IsTracked && t.ApiFootballId != null && t.ApiFootballId > 0)
             .ToListAsync(ct);
 
         var cutoff = DateTime.UtcNow.AddDays(-7);
@@ -216,7 +254,7 @@ public sealed class CollectorPipeline(
 
         foreach (var team in trackedTeams)
         {
-            var envelopes = await apiFootball.GetTransfersByTeamAsync(team.ExternalApiId, ct);
+            var envelopes = await apiFootball.GetTransfersByTeamAsync(team.ApiFootballId!.Value, ct);
 
             var recent = envelopes
                 .SelectMany(env => (env.Transfers ?? []).Select(detail => (env.Player, detail)))
@@ -269,42 +307,37 @@ public sealed class CollectorPipeline(
             ? parsed
             : null;
 
+    /// <summary>Squads of tracked teams, from the ESPN roster.</summary>
     private async Task SyncRostersAsync(CancellationToken ct)
     {
-        var trackedTeams = await db.Teams
-            .AsNoTracking()
-            .Where(t => t.IsTracked && t.ExternalApiId > 0)
-            .ToListAsync(ct);
-
-        foreach (var team in trackedTeams)
+        foreach (var team in await GetEspnTrackedTeamsAsync(ct))
         {
-            var squadPlayers = (await apiFootball.GetSquadByTeamAsync(team.ExternalApiId, ct))
-                .SelectMany(s => s.Players ?? [])
-                .DistinctBy(p => p.Id)
+            var athletes = (await espn.GetRosterAsync(team.LeagueSlug!, team.EspnId!, ct))
+                .DistinctBy(a => a.Id)
                 .ToList();
-            if (squadPlayers.Count == 0)
+            if (athletes.Count == 0)
             {
                 continue;
             }
 
-            var ids = squadPlayers.Select(p => p.Id).ToList();
+            var ids = athletes.Select(a => a.Id).ToList();
             var existing = await db.Players
-                .Where(x => ids.Contains(x.ExternalApiId))
-                .ToDictionaryAsync(x => x.ExternalApiId, ct);
+                .Where(x => ids.Contains(x.EspnId))
+                .ToDictionaryAsync(x => x.EspnId, ct);
 
-            foreach (var p in squadPlayers)
+            foreach (var a in athletes)
             {
-                if (!existing.TryGetValue(p.Id, out var player))
+                if (!existing.TryGetValue(a.Id, out var player))
                 {
-                    player = new Player { ExternalApiId = p.Id, IsTracked = true };
+                    player = new Player { EspnId = a.Id, IsTracked = true };
                     db.Players.Add(player);
                 }
 
                 player.TeamId = team.Id;
-                player.FullName = p.Name;
-                player.Number = p.Number;
-                player.Position = p.Position;
-                player.PhotoUrl = p.Photo;
+                player.FullName = a.Name;
+                player.Number = a.Jersey;
+                player.Position = a.Position;
+                player.PhotoUrl = a.PhotoUrl;
                 player.UpdatedAtUtc = DateTime.UtcNow;
             }
 
@@ -335,7 +368,13 @@ public sealed class CollectorPipeline(
             await Task.Delay(Random.Shared.Next(1200, 2500), ct);
         }
 
-        // 2. Direct Sports RSS feeds filtered locally by tracked keywords
+        // 2. ESPN articles tagged with each tracked team (no key, no quota, highly relevant)
+        foreach (var team in await GetEspnTrackedTeamsAsync(ct))
+        {
+            rawItems.AddRange(await espn.GetTeamNewsAsync(team.LeagueSlug!, team.EspnId!, EspnNewsPerTeam, ct));
+        }
+
+        // 3. Direct Sports RSS feeds filtered locally by tracked keywords
         var allKeywords = aliases.Select(a => a.Keyword).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         foreach (var feed in options.Value.SportsRssFeeds)
         {
@@ -347,14 +386,14 @@ public sealed class CollectorPipeline(
                     (item.Snippet?.Contains(kw, StringComparison.OrdinalIgnoreCase) ?? false))));
         }
 
-        // 3. NewsData.io (optional if key configured): one combined query per run
+        // 4. NewsData.io (optional if key configured): one combined query per run
         var newsDataQuery = NewsDataClient.BuildQuery(allKeywords);
         if (newsDataQuery.Length > 0)
         {
             rawItems.AddRange(await newsData.SearchAsync(newsDataQuery, "en", ct));
         }
 
-        // 4. Deduplicate (URL hash + normalized title) within this run and against the DB
+        // 5. Deduplicate (URL hash + normalized title) within this run and against the DB
         var candidates = new List<(RawNewsItem Item, string Hash, string? TitleKey)>();
         var runHashes = new HashSet<string>(StringComparer.Ordinal);
         var runTitles = new HashSet<string>(StringComparer.Ordinal);

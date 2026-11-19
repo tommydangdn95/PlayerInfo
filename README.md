@@ -4,7 +4,7 @@ Hệ thống tự động thu thập dữ liệu bóng đá (chấn thương, ch
 
 ## 1. Cấu trúc dự án
 
-- `src/PlayerInfo.Api`: ASP.NET Core 9 Web API + Background Queue (`Channel<JobRequest>`) + Clients (`ApiFootballClient`, `RssNewsClient`, `NewsDataClient`, `GeminiEnricherClient`, `TelegramNotifier`) + đăng nhập JWT.
+- `src/PlayerInfo.Api`: ASP.NET Core 9 Web API + Background Queue (`Channel<JobRequest>`) + Clients (`EspnClient`, `ApiFootballClient`, `RssNewsClient`, `NewsDataClient`, `GeminiEnricherClient`, `TelegramNotifier`) + đăng nhập JWT.
 - `src/PlayerInfo.Web`: Trang quản trị (React + Vite): đăng nhập, tổng quan (quota, chạy job, tin mới), quản lý đội bóng & từ khóa.
 - `tests/PlayerInfo.UnitTests`: Unit tests cho clients, controllers, filter xác thực, `CollectorPipeline`, `Deduplicator`, `QuotaManager` và cấu hình.
 - Schema DB được quản lý bằng EF Core migrations (`src/PlayerInfo.Api/Data/Migrations`) và tự áp dụng khi app khởi động.
@@ -23,7 +23,7 @@ Trong **Render Dashboard -> Web Service -> Environment Variables**, thêm các b
 | `Auth__AdminUsername` | Tên đăng nhập dự phòng bằng mật khẩu (mặc định `admin`) |
 | `Auth__AdminPasswordHash` | Hash mật khẩu dự phòng, tạo bằng `dotnet run --project src/PlayerInfo.Api -- hash-password "mat-khau"` (để trống = tắt đăng nhập mật khẩu) |
 | `Auth__JwtSigningKey` | Chuỗi ngẫu nhiên ≥ 32 ký tự để ký JWT (đổi khóa = đăng xuất mọi phiên) |
-| `ApiKeys__ApiFootball` | API Key từ `api-sports.io` (giới hạn 100 req/ngày, app tự chặn ở 90) |
+| `ApiKeys__ApiFootball` | API Key từ `api-sports.io` *(tùy chọn — chỉ dùng cho chuyển nhượng; gói Free chặn mùa hiện tại nên lịch đấu/chấn thương lấy từ ESPN)* |
 | `ApiKeys__NewsData` | API Key từ `newsdata.io` *(tùy chọn)* |
 | `ApiKeys__Gemini` | API Key từ Google AI Studio *(tùy chọn — dùng để tóm tắt & phân loại)* |
 | `Telegram__BotToken` | Token bot Telegram *(tùy chọn)* |
@@ -47,8 +47,10 @@ Mở `https://<app>.onrender.com/` → **Sign in with Google** (tài khoản có
 
 Tạo Google Client ID (một lần): [console.cloud.google.com](https://console.cloud.google.com) → tạo project → **Google Auth Platform / OAuth consent screen** (External, thêm email của bạn làm test user) → **Credentials → Create credentials → OAuth client ID** → loại **Web application** → *Authorized JavaScript origins*: `https://<app>.onrender.com`, `http://localhost`, `http://localhost:5011`, `http://localhost:5173` → copy **Client ID** vào `Auth__GoogleClientId`.
 
-- **Tổng quan:** quota API hôm nay, nút chạy job ngay (`news`, `transfers_news`, `full`, `roster`), tin mới nhất.
-- **Đội bóng:** gõ tên đội (tiếng Anh) → **Tìm** (tốn 1 request API-Football) → **Theo dõi**. Mỗi đội có công tắc theo dõi/tạm dừng, chọn giải, thêm/xóa từ khóa tìm tin (`en`/`vi`), xóa đội.
+- **Tổng quan:** quota API hôm nay, nút chạy job ngay (`news`, `transfers_news`, `full`, `roster`) kèm link xem nhật ký của job vừa chạy, tin mới nhất.
+- **Nhật ký:** log của app theo thời gian thực (lọc theo mức/job, tạm dừng, tự cuộn). Chỉ giữ trong bộ nhớ (~1000 dòng gần nhất), không lưu DB, mất khi app khởi động lại.
+- **Đội bóng:** chọn giải → danh sách đội lấy từ ESPN (không tốn quota) → **Theo dõi**. Mỗi đội có công tắc theo dõi/tạm dừng, thêm/xóa từ khóa tìm tin (`en`/`vi`), xóa đội, và tuỳ chọn **liên kết API-Football** để lấy chuyển nhượng (tìm id tốn 1 request quota).
+- Dữ liệu ESPN (lịch/kết quả 8 giải, đội hình, chấn thương, tin theo đội) không cần key. ESPN là API không chính thức: nếu ESPN đổi định dạng, các bước liên quan trả rỗng và ghi cảnh báo trong log.
 
 Mọi API (trừ `/api/health` và đăng nhập) đều cần JWT. cron-job.org vẫn dùng header `X-Cron-Secret`, nhưng chỉ gọi được `POST /api/jobs/run`.
 

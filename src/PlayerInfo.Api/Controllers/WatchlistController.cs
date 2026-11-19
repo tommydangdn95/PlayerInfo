@@ -13,49 +13,125 @@ namespace PlayerInfo.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
-public sealed class WatchlistController(AppDbContext db) : ControllerBase
+public sealed class WatchlistController(AppDbContext db, IOptions<CollectorOptions> collectorOptions) : ControllerBase
 {
     private static readonly string[] AllowedLanguages = ["en", "vi"];
 
+    /// <param name="EspnId">ESPN team id (from GET league-teams).</param>
+    /// <param name="LeagueSlug">ESPN league slug, one of GET leagues.</param>
+    /// <param name="ApiFootballId">Optional API-Football team id, only needed for transfers.</param>
     public sealed record CreateTeamRequest(
-        int ExternalApiId,
+        string EspnId,
+        string LeagueSlug,
         string Name,
         string? Country = null,
-        int? LeagueExternalId = null,
-        string? LogoUrl = null);
+        string? LogoUrl = null,
+        int? ApiFootballId = null);
 
-    /// <summary>Partial update: only non-null fields are changed.</summary>
+    /// <summary>
+    /// Partial update: only non-null fields change. <c>EspnId</c> + <c>LeagueSlug</c> link a team to ESPN;
+    /// <c>ApiFootballId = 0</c> clears the API-Football link.
+    /// </summary>
     public sealed record UpdateTeamRequest(
         string? Name = null,
         string? Country = null,
-        int? LeagueExternalId = null,
+        string? EspnId = null,
+        string? LeagueSlug = null,
+        int? ApiFootballId = null,
         bool? IsTracked = null);
 
     /// <param name="EntityType">"Team" or "Player".</param>
-    /// <param name="EntityId">Internal <c>Teams.Id</c> / <c>Players.Id</c> (not the API-Football id).</param>
+    /// <param name="EntityId">Internal <c>Teams.Id</c> / <c>Players.Id</c> (not an ESPN or API-Football id).</param>
     public sealed record CreateAliasRequest(string EntityType, int EntityId, string Keyword, string Language = "en");
 
     public sealed record AliasDto(int Id, string Keyword, string Language);
 
     public sealed record TeamDto(
         int Id,
-        int ExternalApiId,
+        string? EspnId,
+        string? LeagueSlug,
+        int? ApiFootballId,
         string Name,
         string? Country,
         string? LogoUrl,
-        int? LeagueExternalId,
         bool IsTracked,
         DateTime UpdatedAtUtc,
         IReadOnlyList<AliasDto> Aliases);
 
-    public sealed record TeamSearchResult(
-        int ExternalApiId,
+    public sealed record LeagueTeamResult(string EspnId, string Name, string? ShortName, string? LogoUrl, int? ExistingTeamId);
+
+    public sealed record ApiFootballTeamResult(
+        int ApiFootballId,
         string Name,
         string? Country,
         string? LogoUrl,
         int? Founded,
         bool National,
-        int? ExistingTeamId);
+        int? LinkedTeamId);
+
+    // ---------------------------------------------------------------- Leagues & lookups
+
+    /// <summary>Configured ESPN leagues (Collector:Leagues).</summary>
+    [HttpGet("leagues")]
+    public IActionResult GetLeagues() => Ok(collectorOptions.Value.Leagues);
+
+    /// <summary>All teams of a configured league from ESPN (no key, no quota), marking those already added.</summary>
+    [HttpGet("league-teams")]
+    public async Task<IActionResult> GetLeagueTeamsAsync(
+        [FromQuery] string? league,
+        [FromServices] EspnClient espn,
+        CancellationToken ct)
+    {
+        var slug = FindLeague(league)?.Slug;
+        if (slug is null)
+        {
+            return BadRequest(new { error = "Giải đấu không hợp lệ." });
+        }
+
+        var teams = await espn.GetLeagueTeamsAsync(slug, ct);
+        var espnIds = teams.Select(t => t.Id).ToList();
+        var existing = await db.Teams.AsNoTracking()
+            .Where(t => t.EspnId != null && espnIds.Contains(t.EspnId))
+            .ToDictionaryAsync(t => t.EspnId!, t => t.Id, ct);
+
+        return Ok(teams
+            .Select(t => new LeagueTeamResult(t.Id, t.Name, t.ShortName, t.LogoUrl, existing.TryGetValue(t.Id, out var id) ? id : null))
+            .ToList());
+    }
+
+    /// <summary>
+    /// Searches API-Football teams by name to find a team's API-Football id (used only for transfers).
+    /// Costs 1 API-Football request from the daily quota.
+    /// </summary>
+    [HttpGet("search-teams")]
+    public async Task<IActionResult> SearchApiFootballTeamsAsync(
+        [FromQuery] string? q,
+        [FromServices] ApiFootballClient apiFootball,
+        CancellationToken ct)
+    {
+        var query = q?.Trim() ?? string.Empty;
+        if (query.Length < 3 || !query.All(c => char.IsLetterOrDigit(c) || c == ' '))
+        {
+            return BadRequest(new { error = "Nhập ít nhất 3 ký tự (chỉ chữ, số và khoảng trắng)." });
+        }
+
+        var found = await apiFootball.SearchTeamsAsync(query, ct);
+        var ids = found.Select(f => (int?)f.Team.Id).ToList();
+        var linked = await db.Teams.AsNoTracking()
+            .Where(t => ids.Contains(t.ApiFootballId))
+            .ToDictionaryAsync(t => t.ApiFootballId!.Value, t => t.Id, ct);
+
+        return Ok(found
+            .Select(f => new ApiFootballTeamResult(
+                f.Team.Id,
+                f.Team.Name,
+                f.Team.Country,
+                f.Team.Logo,
+                f.Team.Founded,
+                f.Team.National,
+                linked.TryGetValue(f.Team.Id, out var teamId) ? teamId : null))
+            .ToList());
+    }
 
     // ---------------------------------------------------------------- Teams
 
@@ -81,68 +157,42 @@ public sealed class WatchlistController(AppDbContext db) : ControllerBase
             return NotFound();
         }
 
-        var aliases = await db.WatchlistAliases.AsNoTracking()
-            .Where(a => a.EntityType == "Team" && a.EntityId == id)
-            .OrderBy(a => a.Keyword)
-            .ToListAsync(ct);
-        return Ok(ToDto(team, aliases));
+        return Ok(ToDto(team, await GetTeamAliasesAsync(id, ct)));
     }
-
-    /// <summary>Searches API-Football for teams to add (uses 1 API-Football request from the daily quota).</summary>
-    [HttpGet("search-teams")]
-    public async Task<IActionResult> SearchTeamsAsync(
-        [FromQuery] string? q,
-        [FromServices] ApiFootballClient apiFootball,
-        CancellationToken ct)
-    {
-        var query = q?.Trim() ?? string.Empty;
-        if (query.Length < 3 || !query.All(c => char.IsLetterOrDigit(c) || c == ' '))
-        {
-            return BadRequest(new { error = "Nhập ít nhất 3 ký tự (chỉ chữ, số và khoảng trắng)." });
-        }
-
-        var found = await apiFootball.SearchTeamsAsync(query, ct);
-        var externalIds = found.Select(f => f.Team.Id).ToList();
-        var existing = await db.Teams.AsNoTracking()
-            .Where(t => externalIds.Contains(t.ExternalApiId))
-            .ToDictionaryAsync(t => t.ExternalApiId, t => t.Id, ct);
-
-        return Ok(found
-            .Select(f => new TeamSearchResult(
-                f.Team.Id,
-                f.Team.Name,
-                f.Team.Country,
-                f.Team.Logo,
-                f.Team.Founded,
-                f.Team.National,
-                existing.TryGetValue(f.Team.Id, out var teamId) ? teamId : null))
-            .ToList());
-    }
-
-    [HttpGet("leagues")]
-    public IActionResult GetTrackedLeagues([FromServices] IOptions<CollectorOptions> options)
-        => Ok(options.Value.TrackedLeagueIds);
 
     [HttpPost("teams")]
     public async Task<IActionResult> AddTeamAsync([FromBody] CreateTeamRequest req, CancellationToken ct)
     {
-        if (req.ExternalApiId <= 0 || string.IsNullOrWhiteSpace(req.Name))
+        var espnId = req.EspnId?.Trim();
+        var league = FindLeague(req.LeagueSlug);
+        if (!IsValidEspnId(espnId) || league is null || string.IsNullOrWhiteSpace(req.Name))
         {
-            return BadRequest(new { error = "externalApiId must be > 0 and name is required." });
+            return BadRequest(new { error = "espnId (số), leagueSlug (một trong các giải đã cấu hình) và name là bắt buộc." });
         }
 
-        if (await db.Teams.AnyAsync(t => t.ExternalApiId == req.ExternalApiId, ct))
+        if (req.ApiFootballId is <= 0)
         {
-            return Conflict(new { error = $"Team with externalApiId={req.ExternalApiId} already exists." });
+            return BadRequest(new { error = "apiFootballId phải > 0." });
+        }
+
+        if (await db.Teams.AnyAsync(t => t.EspnId == espnId, ct))
+        {
+            return Conflict(new { error = $"Đội có ESPN id {espnId} đã tồn tại." });
+        }
+
+        if (req.ApiFootballId is { } afId && await db.Teams.AnyAsync(t => t.ApiFootballId == afId, ct))
+        {
+            return Conflict(new { error = $"API-Football id {afId} đã gắn với đội khác." });
         }
 
         var team = new Team
         {
-            ExternalApiId = req.ExternalApiId,
+            EspnId = espnId,
+            LeagueSlug = league.Slug,
+            ApiFootballId = req.ApiFootballId,
             Name = req.Name.Trim(),
             Country = string.IsNullOrWhiteSpace(req.Country) ? null : req.Country.Trim(),
             LogoUrl = string.IsNullOrWhiteSpace(req.LogoUrl) ? null : req.LogoUrl.Trim(),
-            LeagueExternalId = req.LeagueExternalId,
             IsTracked = true
         };
         db.Teams.Add(team);
@@ -174,9 +224,46 @@ public sealed class WatchlistController(AppDbContext db) : ControllerBase
             team.Country = string.IsNullOrWhiteSpace(req.Country) ? null : req.Country.Trim();
         }
 
-        if (req.LeagueExternalId is not null)
+        if (req.LeagueSlug is not null)
         {
-            team.LeagueExternalId = req.LeagueExternalId > 0 ? req.LeagueExternalId : null;
+            var league = FindLeague(req.LeagueSlug);
+            if (league is null)
+            {
+                return BadRequest(new { error = "Giải đấu không hợp lệ." });
+            }
+
+            team.LeagueSlug = league.Slug;
+        }
+
+        if (req.EspnId is not null)
+        {
+            var espnId = req.EspnId.Trim();
+            if (!IsValidEspnId(espnId))
+            {
+                return BadRequest(new { error = "espnId phải là số." });
+            }
+
+            if (await db.Teams.AnyAsync(t => t.Id != id && t.EspnId == espnId, ct))
+            {
+                return Conflict(new { error = $"ESPN id {espnId} đã gắn với đội khác." });
+            }
+
+            team.EspnId = espnId;
+        }
+
+        if (req.ApiFootballId is not null)
+        {
+            if (req.ApiFootballId < 0)
+            {
+                return BadRequest(new { error = "apiFootballId phải >= 0 (0 để bỏ liên kết)." });
+            }
+
+            if (req.ApiFootballId > 0 && await db.Teams.AnyAsync(t => t.Id != id && t.ApiFootballId == req.ApiFootballId, ct))
+            {
+                return Conflict(new { error = $"API-Football id {req.ApiFootballId} đã gắn với đội khác." });
+            }
+
+            team.ApiFootballId = req.ApiFootballId > 0 ? req.ApiFootballId : null;
         }
 
         if (req.IsTracked is not null)
@@ -184,14 +271,14 @@ public sealed class WatchlistController(AppDbContext db) : ControllerBase
             team.IsTracked = req.IsTracked.Value;
         }
 
+        if (team.EspnId is not null && team.LeagueSlug is null)
+        {
+            return BadRequest(new { error = "Cần chọn giải đấu khi liên kết ESPN." });
+        }
+
         team.UpdatedAtUtc = DateTime.UtcNow;
         await db.SaveChangesAsync(ct);
-
-        var aliases = await db.WatchlistAliases.AsNoTracking()
-            .Where(a => a.EntityType == "Team" && a.EntityId == id)
-            .OrderBy(a => a.Keyword)
-            .ToListAsync(ct);
-        return Ok(ToDto(team, aliases));
+        return Ok(ToDto(team, await GetTeamAliasesAsync(id, ct)));
     }
 
     /// <summary>Deletes the team with its keywords and article links. Players keep existing (TeamId set to null).</summary>
@@ -286,14 +373,29 @@ public sealed class WatchlistController(AppDbContext db) : ControllerBase
 
     private static TeamDto ToDto(Team t, IEnumerable<WatchlistAlias> aliases) => new(
         t.Id,
-        t.ExternalApiId,
+        t.EspnId,
+        t.LeagueSlug,
+        t.ApiFootballId,
         t.Name,
         t.Country,
         t.LogoUrl,
-        t.LeagueExternalId,
         t.IsTracked,
         t.UpdatedAtUtc,
         aliases.Select(a => new AliasDto(a.Id, a.Keyword, a.Language)).ToList());
+
+    private Task<List<WatchlistAlias>> GetTeamAliasesAsync(int teamId, CancellationToken ct)
+        => db.WatchlistAliases.AsNoTracking()
+            .Where(a => a.EntityType == "Team" && a.EntityId == teamId)
+            .OrderBy(a => a.Keyword)
+            .ToListAsync(ct);
+
+    private LeagueOption? FindLeague(string? slug)
+        => string.IsNullOrWhiteSpace(slug)
+            ? null
+            : collectorOptions.Value.Leagues.FirstOrDefault(l => string.Equals(l.Slug, slug.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsValidEspnId(string? espnId)
+        => !string.IsNullOrEmpty(espnId) && espnId.Length <= 20 && espnId.All(char.IsAsciiDigit);
 
     private static string? NormalizeEntityType(string? value) => value?.Trim().ToLowerInvariant() switch
     {

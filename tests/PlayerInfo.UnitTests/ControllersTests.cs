@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Background;
 using PlayerInfo.Api.Controllers;
 using PlayerInfo.Api.Data.Entities;
@@ -8,10 +10,17 @@ namespace PlayerInfo.UnitTests;
 
 public sealed class ControllersTests
 {
+    private static WatchlistController CreateWatchlist(PlayerInfo.Api.Data.AppDbContext db)
+    {
+        var options = new CollectorOptions();
+        options.ApplyDefaults();
+        return new WatchlistController(db, Options.Create(options));
+    }
+
     [Fact]
     public async Task JobsController_Run_ReturnsBadRequest_WhenModeInvalid()
     {
-        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()));
+        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()), Microsoft.Extensions.Logging.Abstractions.NullLogger<JobsController>.Instance);
 
         var result = await controller.RunAsync("invalid_mode");
 
@@ -25,7 +34,7 @@ public sealed class ControllersTests
     [InlineData("ROSTER")]
     public async Task JobsController_Run_ReturnsAccepted_ForValidModes(string mode)
     {
-        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()));
+        var controller = new JobsController(new JobQueue(), TestDbFactory.CreateQuotaManager(Guid.NewGuid().ToString()), Microsoft.Extensions.Logging.Abstractions.NullLogger<JobsController>.Instance);
 
         var result = await controller.RunAsync(mode);
 
@@ -56,10 +65,10 @@ public sealed class ControllersTests
     public async Task WatchlistController_CrudAliases_WorksAndReturnsNotFoundForMissingId()
     {
         await using var db = TestDbFactory.CreateInMemory();
-        var team = new Team { ExternalApiId = 42, Name = "Arsenal" };
+        var team = new Team { EspnId = "359", LeagueSlug = "eng.1", Name = "Arsenal" };
         db.Teams.Add(team);
         await db.SaveChangesAsync();
-        var controller = new WatchlistController(db);
+        var controller = CreateWatchlist(db);
 
         var created = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest("team", team.Id, " Arsenal ", "EN"), CancellationToken.None);
         var createdResult = Assert.IsType<CreatedResult>(created);
@@ -86,9 +95,9 @@ public sealed class ControllersTests
     public async Task WatchlistController_AddAlias_ReturnsBadRequest_ForInvalidInput(string type, int entityId, string keyword, string language)
     {
         await using var db = TestDbFactory.CreateInMemory();
-        db.Teams.Add(new Team { Id = 1, ExternalApiId = 42, Name = "Arsenal" });
+        db.Teams.Add(new Team { Id = 1, EspnId = "359", Name = "Arsenal" });
         await db.SaveChangesAsync();
-        var controller = new WatchlistController(db);
+        var controller = CreateWatchlist(db);
 
         var result = await controller.AddAliasAsync(new WatchlistController.CreateAliasRequest(type, entityId, keyword, language), CancellationToken.None);
 
@@ -96,15 +105,49 @@ public sealed class ControllersTests
     }
 
     [Fact]
-    public async Task WatchlistController_AddTeam_ReturnsConflict_ForDuplicateExternalId()
+    public async Task WatchlistController_AddTeam_ReturnsConflict_ForDuplicateEspnId()
     {
         await using var db = TestDbFactory.CreateInMemory();
-        var controller = new WatchlistController(db);
+        var controller = CreateWatchlist(db);
 
-        var first = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest(33, "Manchester United"), CancellationToken.None);
-        var second = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest(33, "Man Utd"), CancellationToken.None);
+        var first = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest("360", "eng.1", "Manchester United"), CancellationToken.None);
+        var second = await controller.AddTeamAsync(new WatchlistController.CreateTeamRequest("360", "eng.1", "Man Utd"), CancellationToken.None);
 
         Assert.IsType<CreatedResult>(first);
         Assert.IsType<ConflictObjectResult>(second);
+    }
+
+    [Theory]
+    [InlineData("abc", "eng.1", "Name")]     // ESPN id must be numeric
+    [InlineData("360", "xyz.9", "Name")]     // league not configured
+    [InlineData("360", "eng.1", " ")]        // empty name
+    public async Task WatchlistController_AddTeam_ValidatesInput(string espnId, string league, string name)
+    {
+        await using var db = TestDbFactory.CreateInMemory();
+        var result = await CreateWatchlist(db).AddTeamAsync(new WatchlistController.CreateTeamRequest(espnId, league, name), CancellationToken.None);
+        Assert.IsType<BadRequestObjectResult>(result);
+    }
+
+    [Fact]
+    public async Task WatchlistController_LinksLegacyTeam_ToEspnAndApiFootball()
+    {
+        await using var db = TestDbFactory.CreateInMemory();
+        var legacy = new Team { ApiFootballId = 33, Name = "Manchester United" }; // added before the ESPN switch
+        db.Teams.AddRange(legacy, new Team { EspnId = "359", LeagueSlug = "eng.1", ApiFootballId = 42, Name = "Arsenal" });
+        await db.SaveChangesAsync();
+        var controller = CreateWatchlist(db);
+
+        var linked = await controller.UpdateTeamAsync(legacy.Id, new WatchlistController.UpdateTeamRequest(EspnId: "360", LeagueSlug: "eng.1"), CancellationToken.None);
+        var dto = Assert.IsType<WatchlistController.TeamDto>(Assert.IsType<OkObjectResult>(linked).Value);
+        Assert.Equal(("360", "eng.1", (int?)33), (dto.EspnId, dto.LeagueSlug, dto.ApiFootballId));
+
+        var takenEspn = await controller.UpdateTeamAsync(legacy.Id, new WatchlistController.UpdateTeamRequest(EspnId: "359"), CancellationToken.None);
+        Assert.IsType<ConflictObjectResult>(takenEspn);
+
+        var takenApiFootball = await controller.UpdateTeamAsync(legacy.Id, new WatchlistController.UpdateTeamRequest(ApiFootballId: 42), CancellationToken.None);
+        Assert.IsType<ConflictObjectResult>(takenApiFootball);
+
+        var cleared = await controller.UpdateTeamAsync(legacy.Id, new WatchlistController.UpdateTeamRequest(ApiFootballId: 0), CancellationToken.None);
+        Assert.Null(Assert.IsType<WatchlistController.TeamDto>(Assert.IsType<OkObjectResult>(cleared).Value).ApiFootballId);
     }
 }

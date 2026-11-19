@@ -82,7 +82,7 @@ public sealed class AuthIntegrationTests(ApiFactory factory) : IClassFixture<Api
         Assert.Equal(HttpStatusCode.Accepted, (await cron.PostAsync("/api/jobs/run?mode=news", null)).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await cron.GetAsync("/api/news")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized,
-            (await cron.PostAsJsonAsync("/api/watchlist/teams", new { externalApiId = 1, name = "X" })).StatusCode);
+            (await cron.PostAsJsonAsync("/api/watchlist/teams", new { espnId = "1", leagueSlug = "eng.1", name = "X" })).StatusCode);
     }
 
     [Theory]
@@ -137,7 +137,7 @@ public sealed class AuthIntegrationTests(ApiFactory factory) : IClassFixture<Api
         var externalId = Random.Shared.Next(100_000, 900_000);
 
         var created = await admin.PostAsJsonAsync("/api/watchlist/teams",
-            new { externalApiId = externalId, name = "Test FC", country = "England", logoUrl = "https://media.example/logo.png" });
+            new { espnId = externalId.ToString(), leagueSlug = "eng.1", name = "Test FC", country = "England", logoUrl = "https://media.example/logo.png" });
         Assert.Equal(HttpStatusCode.Created, created.StatusCode);
         var team = await created.Content.ReadFromJsonAsync<JsonElement>();
         var teamId = team.GetProperty("id").GetInt32();
@@ -146,10 +146,10 @@ public sealed class AuthIntegrationTests(ApiFactory factory) : IClassFixture<Api
             new { entityType = "Team", entityId = teamId, keyword = "Test FC", language = "en" });
         Assert.Equal(HttpStatusCode.Created, alias.StatusCode);
 
-        var patched = await admin.PatchAsJsonAsync($"/api/watchlist/teams/{teamId}", new { isTracked = false, leagueExternalId = 39 });
+        var patched = await admin.PatchAsJsonAsync($"/api/watchlist/teams/{teamId}", new { isTracked = false, apiFootballId = externalId });
         var patchedBody = await patched.Content.ReadFromJsonAsync<JsonElement>();
         Assert.False(patchedBody.GetProperty("isTracked").GetBoolean());
-        Assert.Equal(39, patchedBody.GetProperty("leagueExternalId").GetInt32());
+        Assert.Equal(externalId, patchedBody.GetProperty("apiFootballId").GetInt32());
         Assert.Single(patchedBody.GetProperty("aliases").EnumerateArray());
 
         Assert.Equal(HttpStatusCode.NoContent, (await admin.DeleteAsync($"/api/watchlist/teams/{teamId}")).StatusCode);

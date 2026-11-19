@@ -83,3 +83,54 @@ export async function api<T>(path: string, options: { method?: string; body?: un
 export function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : 'Đã có lỗi xảy ra.';
 }
+
+/**
+ * Reads a Server-Sent Events stream with fetch() (EventSource cannot send the Authorization header).
+ * Calls `onEvent` for every `data:` event with its `id`; resolves when the server closes the stream
+ * and rejects on network errors or when `signal` aborts.
+ */
+export async function readEventStream(
+  path: string,
+  onEvent: (id: string | null, data: string) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const session = loadSession();
+  const res = await fetch(path, {
+    headers: {
+      Accept: 'text/event-stream',
+      ...(session ? { Authorization: `Bearer ${session.accessToken}` } : {}),
+    },
+    signal,
+  });
+
+  if (res.status === 401 && session) {
+    clearSession();
+    window.dispatchEvent(new Event(LOGOUT_EVENT));
+    throw new ApiError('Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại.', 401);
+  }
+  if (!res.ok || !res.body) {
+    throw new ApiError(await readError(res), res.status);
+  }
+
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += value.replace(/\r\n/g, '\n');
+
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) >= 0) {
+      const block = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+
+      let id: string | null = null;
+      const data: string[] = [];
+      for (const line of block.split('\n')) {
+        if (line.startsWith('id:')) id = line.slice(3).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      }
+      if (data.length > 0) onEvent(id, data.join('\n'));
+    }
+  }
+}

@@ -10,7 +10,7 @@ public sealed class CollectorPipelineTests
 {
     private static async Task<Team> SeedArsenalAsync(PipelineHarness h)
     {
-        var team = new Team { ExternalApiId = 42, Name = "Arsenal", IsTracked = true };
+        var team = new Team { EspnId = "359", LeagueSlug = "eng.1", ApiFootballId = 42, Name = "Arsenal", IsTracked = true };
         h.Db.Teams.Add(team);
         await h.Db.SaveChangesAsync();
         h.Db.WatchlistAliases.Add(new WatchlistAlias { EntityType = "Team", EntityId = team.Id, Keyword = "Arsenal", Language = "en" });
@@ -174,7 +174,7 @@ public sealed class CollectorPipelineTests
         await SeedArsenalAsync(h);
         h.ApiKeys.ApiFootball = "key";
         h.ApiKeys.Gemini = string.Empty;
-        h.Collector.TrackedLeagueIds = [39];
+        h.Collector.Leagues = [new("eng.1", "Premier League")];
         // A transfers payload with "teams": null throws inside the SyncTransfers step.
         h.ApiFootball = req => req.RequestUri!.AbsolutePath.Contains("transfers")
             ? TestDbFactory.JsonResponse("""{"response":[{"player":{"id":1,"name":"X"},"transfers":[{"date":"2099-01-01","type":"Loan","teams":null}]}]}""")
@@ -193,8 +193,8 @@ public sealed class CollectorPipelineTests
         await using var h = new PipelineHarness();
         h.ApiKeys.ApiFootball = "key";
         h.Db.Teams.AddRange(
-            new Team { ExternalApiId = 42, Name = "Arsenal" },
-            new Team { ExternalApiId = 47, Name = "Tottenham" });
+            new Team { ApiFootballId = 42, Name = "Arsenal" },
+            new Team { ApiFootballId = 47, Name = "Tottenham" });
         await h.Db.SaveChangesAsync();
 
         var date = DateTime.UtcNow.AddDays(-1).ToString("yyyy-MM-dd");
@@ -229,4 +229,95 @@ public sealed class CollectorPipelineTests
     [InlineData(null, "Other")]
     public void NormalizeCategory_MapsToKnownCategories(string? input, string expected)
         => Assert.Equal(expected, CollectorPipeline.NormalizeCategory(input));
+
+    // ---------------------------------------------------------------- ESPN steps
+
+    private static Func<HttpRequestMessage, HttpResponseMessage> EspnRoutes(string? scoreboard = null, string? roster = null, string? news = null)
+        => req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            var body = path.EndsWith("/scoreboard") ? scoreboard
+                : path.EndsWith("/roster") ? roster
+                : path.EndsWith("/news") ? news
+                : null;
+            return TestDbFactory.JsonResponse(body ?? "{}");
+        };
+
+    [Fact]
+    public async Task RunAsync_Full_SyncsFixturesFromEspnScoreboard_AndUpdatesExistingRows()
+    {
+        await using var h = new PipelineHarness();
+        h.ApiKeys.Gemini = string.Empty;
+        h.Collector.Leagues = [new("eng.1", "Premier League")];
+        h.Espn = EspnRoutes(scoreboard: EspnClientTests.ScoreboardJson);
+        h.Db.Fixtures.Add(new Fixture { EspnEventId = "402", LeagueSlug = "eng.1", StatusShort = "OLD", HomeTeamName = "x", AwayTeamName = "y" });
+        await h.Db.SaveChangesAsync();
+
+        await h.Build().RunAsync(CollectorMode.Full);
+
+        await using var read = h.NewContext();
+        var fixtures = await read.Fixtures.OrderBy(f => f.EspnEventId).ToListAsync();
+        Assert.Equal(["401", "402"], fixtures.Select(f => f.EspnEventId)); // same events on 3 dates: no duplicates
+        Assert.Equal((2, 1), (fixtures[0].HomeGoals, fixtures[0].AwayGoals));
+        Assert.Equal("Premier League", fixtures[0].LeagueName);
+        Assert.Equal("STATUS_SCHEDULED", fixtures[1].StatusShort);
+        Assert.Equal("Manchester City", fixtures[1].HomeTeamName);
+        Assert.Equal(3, h.EspnHandler!.Requests.Count(r => r.RequestUri!.AbsolutePath.EndsWith("/scoreboard")));
+    }
+
+    [Fact]
+    public async Task RunAsync_Full_SavesInjuriesFromEspnRoster_WithoutDuplicatesAcrossRuns()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.ApiKeys.Gemini = string.Empty;
+        h.Espn = EspnRoutes(roster: EspnClientTests.RosterJson);
+
+        await h.Build().RunAsync(CollectorMode.Full);
+        await h.Build().RunAsync(CollectorMode.Full); // undated injury listed again the next run
+
+        await using var read = h.NewContext();
+        var injuries = await read.PlayerInjuries.OrderBy(i => i.PlayerEspnId).ToListAsync();
+        Assert.Equal(2, injuries.Count);
+        Assert.Equal(("1001", "Hamstring - Strain - Leg", "Out"), (injuries[0].PlayerEspnId, injuries[0].Reason, injuries[0].Type));
+        Assert.Equal(new DateTime(2026, 11, 15, 0, 0, 0, DateTimeKind.Utc), injuries[0].ReportedDateUtc);
+        Assert.Equal(("1003", "Knock", "Arsenal", "359"), (injuries[1].PlayerEspnId, injuries[1].Reason, injuries[1].TeamName, injuries[1].TeamEspnId));
+    }
+
+    [Fact]
+    public async Task RunAsync_Roster_UpsertsPlayersFromEspn()
+    {
+        await using var h = new PipelineHarness();
+        var team = await SeedArsenalAsync(h);
+        h.Espn = EspnRoutes(roster: EspnClientTests.RosterJson);
+        h.Db.Players.Add(new Player { EspnId = "1001", FullName = "Old Name" });
+        await h.Db.SaveChangesAsync();
+
+        await h.Build().RunAsync(CollectorMode.Roster);
+
+        await using var read = h.NewContext();
+        var players = await read.Players.OrderBy(p => p.EspnId).ToListAsync();
+        Assert.Equal(3, players.Count);
+        Assert.All(players, p => Assert.Equal(team.Id, p.TeamId));
+        Assert.Equal(("Bukayo Saka", 7), (players[0].FullName, players[0].Number));
+    }
+
+    [Fact]
+    public async Task RunAsync_News_IngestsEspnTeamNews_ForLinkedTeams()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.ApiKeys.Gemini = string.Empty;
+        h.Espn = EspnRoutes(news: EspnClientTests.NewsJson);
+        h.Db.Teams.Add(new Team { Name = "Not linked", ApiFootballId = 99 }); // no ESPN id: skipped
+        await h.Db.SaveChangesAsync();
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        var article = await read.NewsArticles.SingleAsync();
+        Assert.Equal(("ESPN", "Arsenal win again"), (article.SourceName, article.Title));
+        var newsCall = Assert.Single(h.EspnHandler!.Requests, r => r.RequestUri!.AbsolutePath.EndsWith("/news"));
+        Assert.Contains("team=359", newsCall.RequestUri!.Query);
+    }
 }

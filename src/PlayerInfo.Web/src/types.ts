@@ -6,24 +6,43 @@ export interface Alias {
 
 export interface Team {
   id: number;
-  externalApiId: number;
+  /** ESPN team id; null for teams not yet linked to ESPN. */
+  espnId: string | null;
+  /** ESPN league slug, e.g. "eng.1". */
+  leagueSlug: string | null;
+  /** Optional API-Football id, only used for transfers. */
+  apiFootballId: number | null;
   name: string;
   country: string | null;
   logoUrl: string | null;
-  leagueExternalId: number | null;
   isTracked: boolean;
   updatedAtUtc: string;
   aliases: Alias[];
 }
 
-export interface TeamSearchResult {
-  externalApiId: number;
+export interface League {
+  slug: string;
+  name: string;
+}
+
+/** A team of an ESPN league, as listed for adding/linking. */
+export interface LeagueTeam {
+  espnId: string;
+  name: string;
+  shortName: string | null;
+  logoUrl: string | null;
+  existingTeamId: number | null;
+}
+
+/** API-Football search result, used to link a team for transfers. */
+export interface ApiFootballTeam {
+  apiFootballId: number;
   name: string;
   country: string | null;
   logoUrl: string | null;
   founded: number | null;
   national: boolean;
-  existingTeamId: number | null;
+  linkedTeamId: number | null;
 }
 
 export interface Quota {
@@ -52,20 +71,9 @@ export interface NewsPage {
 
 export type JobMode = 'news' | 'transfers_news' | 'full' | 'roster';
 
-/** Names for common API-Football league ids; unknown ids fall back to "Giải #id". */
-export const LEAGUE_NAMES: Record<number, string> = {
-  39: 'Premier League (Anh)',
-  140: 'La Liga (Tây Ban Nha)',
-  135: 'Serie A (Ý)',
-  78: 'Bundesliga (Đức)',
-  61: 'Ligue 1 (Pháp)',
-  2: 'Champions League',
-  3: 'Europa League',
-};
-
-export function leagueName(id: number | null | undefined): string {
-  if (!id) return '—';
-  return LEAGUE_NAMES[id] ?? `Giải #${id}`;
+export function leagueName(slug: string | null | undefined, leagues: League[]): string {
+  if (!slug) return '—';
+  return leagues.find((l) => l.slug === slug)?.name ?? slug;
 }
 
 export function formatDateTime(utc: string): string {

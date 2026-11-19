@@ -10,7 +10,7 @@ namespace PlayerInfo.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-public sealed class JobsController(JobQueue queue, QuotaManager quota) : ControllerBase
+public sealed class JobsController(JobQueue queue, QuotaManager quota, ILogger<JobsController> logger) : ControllerBase
 {
     /// <summary>
     /// Triggers the collector pipeline asynchronously and returns 202 Accepted immediately.
@@ -24,10 +24,13 @@ public sealed class JobsController(JobQueue queue, QuotaManager quota) : Control
             return BadRequest(new { error = "Invalid mode. Allowed: full, transfers_news, news, roster." });
         }
 
-        await queue.EnqueueAsync(new JobRequest(parsedMode, DateTime.UtcNow), ct);
+        var jobId = JobRequest.NewJobId();
+        await queue.EnqueueAsync(new JobRequest(parsedMode, DateTime.UtcNow, jobId), ct);
+        logger.LogInformation("Queued job {JobId} mode={Mode} by {User}", jobId, parsedMode, HttpContext?.User?.Identity?.Name ?? "cron");
         return Accepted(new
         {
             queued = true,
+            jobId,
             mode = parsedMode.ToString(),
             queuedAtUtc = DateTime.UtcNow
         });

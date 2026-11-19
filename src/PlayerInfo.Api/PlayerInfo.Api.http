@@ -11,20 +11,19 @@ Content-Type: application/json
 ### 1. Health check (public)
 GET {{host}}/api/health
 
-### 2. Search teams on API-Football (costs 1 request)
-GET {{host}}/api/watchlist/search-teams?q=manchester
+### 2. List the teams of an ESPN league (no quota)
+GET {{host}}/api/watchlist/league-teams?league=eng.1
 Authorization: Bearer {{token}}
 
-### 3. Add tracked team (Manchester United)
+### 3. Add tracked team (Manchester United, ESPN id 360)
 POST {{host}}/api/watchlist/teams
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {
-  "externalApiId": 33,
-  "name": "Manchester United",
-  "country": "England",
-  "leagueExternalId": 39
+  "espnId": "360",
+  "leagueSlug": "eng.1",
+  "name": "Manchester United"
 }
 
 ### 4. Add search keyword alias (entityId = internal team id from step 3)
@@ -38,6 +37,10 @@ Content-Type: application/json
   "keyword": "Manchester United",
   "language": "en"
 }
+
+### 4b. Optional: find the API-Football id for transfers (costs 1 request), then PATCH apiFootballId
+GET {{host}}/api/watchlist/search-teams?q=manchester
+Authorization: Bearer {{token}}
 
 ### 5. Pause tracking a team
 PATCH {{host}}/api/watchlist/teams/1

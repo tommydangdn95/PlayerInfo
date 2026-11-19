@@ -8,6 +8,8 @@ namespace PlayerInfo.Api.Clients;
 
 /// <summary>
 /// Client for API-Football (v3.api-sports.io) with built-in daily quota protection.
+/// Only used for transfers (and to look up a team's API-Football id): the free plan blocks the
+/// current season for injuries/fixtures, which come from ESPN instead.
 /// </summary>
 public sealed class ApiFootballClient(
     HttpClient http,
@@ -23,31 +25,10 @@ public sealed class ApiFootballClient(
         PropertyNameCaseInsensitive = true
     };
 
-    public async Task<IReadOnlyList<ApiFootballInjuryItem>> GetInjuriesByLeagueAsync(
-        int leagueId, int season, CancellationToken ct = default)
-    {
-        var resp = await SendAsync<ApiFootballInjuryItem>($"injuries?league={leagueId}&season={season}", ct);
-        return resp ?? [];
-    }
-
-    public async Task<IReadOnlyList<ApiFootballFixtureItem>> GetFixturesByDateAsync(
-        DateOnly date, CancellationToken ct = default)
-    {
-        var resp = await SendAsync<ApiFootballFixtureItem>($"fixtures?date={date:yyyy-MM-dd}&timezone=UTC", ct);
-        return resp ?? [];
-    }
-
     public async Task<IReadOnlyList<ApiFootballTransferEnvelope>> GetTransfersByTeamAsync(
         int teamExternalId, CancellationToken ct = default)
     {
         var resp = await SendAsync<ApiFootballTransferEnvelope>($"transfers?team={teamExternalId}", ct);
-        return resp ?? [];
-    }
-
-    public async Task<IReadOnlyList<ApiFootballSquadEnvelope>> GetSquadByTeamAsync(
-        int teamExternalId, CancellationToken ct = default)
-    {
-        var resp = await SendAsync<ApiFootballSquadEnvelope>($"players/squads?team={teamExternalId}", ct);
         return resp ?? [];
     }
 
@@ -118,28 +99,7 @@ public sealed record ApiFootballEnvelope<T>(
     [property: JsonPropertyName("response")] List<T>? Response,
     [property: JsonPropertyName("errors")] JsonElement Errors);
 
-public sealed record ApiFootballInjuryItem(
-    ApiFootballNamedEntity Player,
-    ApiFootballNamedEntity Team,
-    ApiFootballFixtureRef Fixture,
-    ApiFootballInjuryDetails? Injury);
-
 public sealed record ApiFootballNamedEntity(int Id, string Name, string? Photo, string? Logo);
-public sealed record ApiFootballFixtureRef(int Id, DateTimeOffset Date);
-public sealed record ApiFootballInjuryDetails(string? Type, string? Reason);
-
-public sealed record ApiFootballFixtureItem(
-    ApiFootballFixtureMeta Fixture,
-    ApiFootballLeagueMeta League,
-    ApiFootballTeamsPair Teams,
-    ApiFootballGoalsPair Goals);
-
-public sealed record ApiFootballFixtureMeta(int Id, DateTimeOffset Date, ApiFootballFixtureStatus Status);
-public sealed record ApiFootballFixtureStatus(string Short);
-public sealed record ApiFootballLeagueMeta(int Id, string Name);
-public sealed record ApiFootballTeamsPair(ApiFootballNamedEntity Home, ApiFootballNamedEntity Away);
-public sealed record ApiFootballGoalsPair(int? Home, int? Away);
-
 public sealed record ApiFootballTransferEnvelope(
     ApiFootballNamedEntity Player,
     DateTimeOffset? Update,
@@ -152,12 +112,7 @@ public sealed record ApiFootballTransferDetail(
 
 public sealed record ApiFootballTransferTeams(ApiFootballNamedEntity In, ApiFootballNamedEntity Out);
 
-public sealed record ApiFootballSquadEnvelope(
-    ApiFootballNamedEntity Team,
-    List<ApiFootballSquadPlayer> Players);
-
 public sealed record ApiFootballTeamSearchItem(ApiFootballTeamInfo Team);
 
 public sealed record ApiFootballTeamInfo(int Id, string Name, string? Country, int? Founded, bool National, string? Logo);
 
-public sealed record ApiFootballSquadPlayer(int Id, string Name, int? Number, string? Position, string? Photo);

@@ -83,12 +83,14 @@ public sealed class PipelineHarness : IAsyncDisposable
     public Func<HttpRequestMessage, HttpResponseMessage> Gemini { get; set; } = _ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse("[]"));
     public Func<HttpRequestMessage, HttpResponseMessage> Telegram { get; set; } = _ => TestDbFactory.JsonResponse("{\"ok\":true}");
     public Func<HttpRequestMessage, HttpResponseMessage> ApiFootball { get; set; } = _ => TestDbFactory.JsonResponse("{\"response\":[]}");
+    public Func<HttpRequestMessage, HttpResponseMessage> Espn { get; set; } = _ => TestDbFactory.JsonResponse("{}");
 
     public ApiKeysOptions ApiKeys { get; } = new() { Gemini = "gemini-key" };
     public TelegramOptions TelegramOptions { get; } = new();
-    public CollectorOptions Collector { get; } = new() { SportsRssFeeds = [] };
+    public CollectorOptions Collector { get; } = new() { SportsRssFeeds = [], Leagues = [] };
 
     public StubHttpMessageHandler? TelegramHandler { get; private set; }
+    public StubHttpMessageHandler? EspnHandler { get; private set; }
 
     public CollectorPipeline Build()
     {
@@ -96,6 +98,10 @@ public sealed class PipelineHarness : IAsyncDisposable
         var keys = Options.Create(ApiKeys);
         var collector = Options.Create(Collector);
 
+        EspnHandler = new StubHttpMessageHandler(Espn);
+        var espn = new EspnClient(
+            new HttpClient(EspnHandler) { BaseAddress = new Uri(EspnClient.BaseUrl) },
+            NullLogger<EspnClient>.Instance);
         var rss = new RssNewsClient(new HttpClient(new StubHttpMessageHandler(Rss)), NullLogger<RssNewsClient>.Instance);
         var apiFootball = new ApiFootballClient(
             new HttpClient(new StubHttpMessageHandler(ApiFootball)) { BaseAddress = new Uri("https://v3.api-sports.io/") },
@@ -109,7 +115,7 @@ public sealed class PipelineHarness : IAsyncDisposable
         TelegramHandler = new StubHttpMessageHandler(Telegram);
         var telegram = new TelegramNotifier(new HttpClient(TelegramHandler), Options.Create(TelegramOptions), NullLogger<TelegramNotifier>.Instance);
 
-        return new CollectorPipeline(Db, apiFootball, rss, newsData, gemini, telegram, collector, NullLogger<CollectorPipeline>.Instance);
+        return new CollectorPipeline(Db, espn, apiFootball, rss, newsData, gemini, telegram, collector, NullLogger<CollectorPipeline>.Instance);
     }
 
     /// <summary>A fresh context over the same database, to read results without the pipeline's tracked entities.</summary>
