@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Clients;
@@ -36,6 +37,7 @@ public sealed class CollectorPipeline(
 
     /// <summary>Articles still not AI-processed after this long are given up on (not retried, not notified).</summary>
     public static readonly TimeSpan PendingAiMaxAge = TimeSpan.FromHours(48);
+    public static readonly TimeSpan UntaggedBackfillWindow = TimeSpan.FromDays(30);
 
     /// <summary>How far back stored headlines are compared for title-based deduplication.</summary>
     public static readonly TimeSpan TitleDedupWindow = TimeSpan.FromDays(3);
@@ -352,11 +354,23 @@ public sealed class CollectorPipeline(
         var aliases = await db.WatchlistAliases.AsNoTracking().ToListAsync(ct);
         var rawItems = new List<RawNewsItem>();
 
+        // The team/player each item was fetched for, so articles are grouped by team even without Gemini.
+        var sourceTags = new Dictionary<RawNewsItem, EntityRef>();
+        void AddFor(IEnumerable<RawNewsItem> items, EntityRef entity)
+        {
+            foreach (var item in items)
+            {
+                rawItems.Add(item);
+                sourceTags.TryAdd(item, entity);
+            }
+        }
+
         // 1. Google News RSS grouped by entity & language (with jitter to avoid IP throttling)
         var groupedQueries = aliases
             .GroupBy(a => new { a.EntityType, a.EntityId, a.Language })
             .Select(g => new
             {
+                Entity = new EntityRef(g.Key.EntityType, g.Key.EntityId),
                 g.Key.Language,
                 Query = string.Join(" OR ", g.Select(x => $"\"{x.Keyword}\""))
             })
@@ -364,14 +378,14 @@ public sealed class CollectorPipeline(
 
         foreach (var q in groupedQueries)
         {
-            rawItems.AddRange(await rssNews.FetchGoogleNewsAsync(q.Query, q.Language, ct));
+            AddFor(await rssNews.FetchGoogleNewsAsync(q.Query, q.Language, ct), q.Entity);
             await Task.Delay(Random.Shared.Next(1200, 2500), ct);
         }
 
         // 2. ESPN articles tagged with each tracked team (no key, no quota, highly relevant)
         foreach (var team in await GetEspnTrackedTeamsAsync(ct))
         {
-            rawItems.AddRange(await espn.GetTeamNewsAsync(team.LeagueSlug!, team.EspnId!, EspnNewsPerTeam, ct));
+            AddFor(await espn.GetTeamNewsAsync(team.LeagueSlug!, team.EspnId!, EspnNewsPerTeam, ct), new EntityRef("Team", team.Id));
         }
 
         // 3. Direct Sports RSS feeds filtered locally by tracked keywords
@@ -393,20 +407,35 @@ public sealed class CollectorPipeline(
             rawItems.AddRange(await newsData.SearchAsync(newsDataQuery, "en", ct));
         }
 
-        // 5. Deduplicate (URL hash + normalized title) within this run and against the DB
-        var candidates = new List<(RawNewsItem Item, string Hash, string? TitleKey)>();
-        var runHashes = new HashSet<string>(StringComparer.Ordinal);
-        var runTitles = new HashSet<string>(StringComparer.Ordinal);
+        // 5. Deduplicate (URL hash + normalized title) within this run and against the DB.
+        //    A duplicate still contributes its tags: the same story fetched for two teams is about both.
+        var matcher = new KeywordMatcher(aliases);
+        var candidates = new List<(RawNewsItem Item, string Hash, string? TitleKey, HashSet<EntityRef> Tags)>();
+        var byHash = new Dictionary<string, HashSet<EntityRef>>(StringComparer.Ordinal);
+        var byTitle = new Dictionary<string, HashSet<EntityRef>>(StringComparer.Ordinal);
         foreach (var item in rawItems)
         {
+            var tags = matcher.Match(item.Title, item.Snippet);
+            if (sourceTags.TryGetValue(item, out var source))
+            {
+                tags.Add(source);
+            }
+
             var hash = Deduplicator.ComputeUrlHash(item.Url);
             var titleKey = Deduplicator.ComputeTitleKey(item.Title);
-            if (!runHashes.Add(hash) || (titleKey is not null && !runTitles.Add(titleKey)))
+            if (byHash.TryGetValue(hash, out var kept) || (titleKey is not null && byTitle.TryGetValue(titleKey, out kept)))
             {
+                kept.UnionWith(tags);
                 continue;
             }
 
-            candidates.Add((item, hash, titleKey));
+            byHash[hash] = tags;
+            if (titleKey is not null)
+            {
+                byTitle[titleKey] = tags;
+            }
+
+            candidates.Add((item, hash, titleKey, tags));
         }
 
         if (candidates.Count == 0)
@@ -433,7 +462,7 @@ public sealed class CollectorPipeline(
             .ToHashSet(StringComparer.Ordinal);
 
         var added = 0;
-        foreach (var (item, hash, titleKey) in candidates)
+        foreach (var (item, hash, titleKey, tags) in candidates)
         {
             if (existingHashes.Contains(hash) || (titleKey is not null && existingTitleKeys.Contains(titleKey)))
             {
@@ -448,7 +477,8 @@ public sealed class CollectorPipeline(
                 Snippet = item.Snippet,
                 SourceName = item.SourceName.Length > 150 ? item.SourceName[..150] : item.SourceName,
                 Language = item.Language,
-                PublishedAtUtc = item.PublishedAtUtc
+                PublishedAtUtc = item.PublishedAtUtc,
+                Entities = tags.Select(t => new ArticleEntity { EntityType = t.Type, EntityId = t.Id }).ToList()
             });
             added++;
         }
@@ -459,6 +489,72 @@ public sealed class CollectorPipeline(
         }
 
         logger.LogInformation("Ingested {Raw} raw items, saved {Added} new unique articles", rawItems.Count, added);
+
+        await TagUntaggedRecentArticlesAsync(matcher, ct);
+    }
+
+    /// <summary>
+    /// Articles saved before ingest-time tagging existed (or before a keyword was added) get their teams
+    /// from keyword matches, so the admin UI can group them by team.
+    /// </summary>
+    private async Task TagUntaggedRecentArticlesAsync(KeywordMatcher matcher, CancellationToken ct)
+    {
+        if (matcher.IsEmpty)
+        {
+            return;
+        }
+
+        var since = DateTime.UtcNow - UntaggedBackfillWindow;
+        var untagged = await db.NewsArticles
+            .AsNoTracking()
+            .Where(x => x.PublishedAtUtc >= since && !x.Entities.Any())
+            .Select(x => new { x.Id, x.Title, x.Snippet })
+            .ToListAsync(ct);
+
+        var tagged = 0;
+        foreach (var art in untagged)
+        {
+            var tags = matcher.Match(art.Title, art.Snippet);
+            foreach (var tag in tags)
+            {
+                db.ArticleEntities.Add(new ArticleEntity { ArticleId = art.Id, EntityType = tag.Type, EntityId = tag.Id });
+            }
+
+            tagged += tags.Count > 0 ? 1 : 0;
+        }
+
+        if (tagged > 0)
+        {
+            await db.SaveChangesAsync(ct);
+            logger.LogInformation("Tagged {Count} older articles with their teams by keyword", tagged);
+        }
+    }
+
+    internal readonly record struct EntityRef(string Type, int Id);
+
+    /// <summary>Whole-word, case-insensitive match of watchlist keywords in a title or snippet.</summary>
+    internal sealed class KeywordMatcher
+    {
+        private readonly List<(Regex Pattern, EntityRef Entity)> _patterns;
+
+        public KeywordMatcher(IEnumerable<WatchlistAlias> aliases)
+        {
+            _patterns = aliases
+                .Where(a => !string.IsNullOrWhiteSpace(a.Keyword))
+                .Select(a => (
+                    new Regex($@"(?<![\p{{L}}\p{{N}}]){Regex.Escape(a.Keyword.Trim())}(?![\p{{L}}\p{{N}}])",
+                        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+                    new EntityRef(a.EntityType, a.EntityId)))
+                .ToList();
+        }
+
+        public bool IsEmpty => _patterns.Count == 0;
+
+        public HashSet<EntityRef> Match(string title, string? snippet)
+        {
+            var text = snippet is null ? title : $"{title}\n{snippet}";
+            return _patterns.Where(p => p.Pattern.IsMatch(text)).Select(p => p.Entity).ToHashSet();
+        }
     }
 
     private async Task EnrichPendingArticlesAsync(CancellationToken ct)
@@ -495,6 +591,13 @@ public sealed class CollectorPipeline(
 
         foreach (var chunk in pending.Chunk(batchSize))
         {
+            var chunkIds = chunk.Select(a => a.Id).ToList();
+            var existingLinks = (await db.ArticleEntities
+                    .Where(e => chunkIds.Contains(e.ArticleId))
+                    .Select(e => new { e.ArticleId, e.EntityType, e.EntityId })
+                    .ToListAsync(ct))
+                .ToLookup(e => e.ArticleId, e => (e.EntityType, e.EntityId));
+
             var batch = await gemini.EnrichBatchAsync(chunk, trackedNames, ct);
             if (!batch.Succeeded)
             {
@@ -518,10 +621,11 @@ public sealed class CollectorPipeline(
                 }
 
                 art.IsRelevant = r.IsRelevant;
+                art.IsHot = r.IsRelevant && r.IsHot;
                 art.Category = NormalizeCategory(r.Category);
                 art.SummaryVi = string.IsNullOrWhiteSpace(r.SummaryVi) ? null : r.SummaryVi.Trim();
                 art.IsAiProcessed = true;
-                LinkMatchedEntities(art, r.MatchedEntities ?? [], teams, players);
+                LinkMatchedEntities(art, r.MatchedEntities ?? [], teams, players, existingLinks[art.Id]);
             }
 
             await db.SaveChangesAsync(ct);
@@ -559,11 +663,12 @@ public sealed class CollectorPipeline(
         NewsArticle article,
         IReadOnlyList<string> matchedNames,
         IReadOnlyList<Team> teams,
-        IReadOnlyList<Player> players)
+        IReadOnlyList<Player> players,
+        IEnumerable<(string Type, int Id)> alreadyLinked)
     {
-        // Several returned names can resolve to the same entity ("Arsenal", "Arsenal FC");
-        // ArticleEntities has a composite key, so each (type, id) may only be added once.
-        var linked = new HashSet<(string Type, int Id)>();
+        // Several returned names can resolve to the same entity ("Arsenal", "Arsenal FC"), and ingestion
+        // may already have linked it; ArticleEntities has a composite key, so each (type, id) is added once.
+        var linked = alreadyLinked.ToHashSet();
 
         foreach (var name in matchedNames.Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim()))
         {
@@ -601,7 +706,8 @@ public sealed class CollectorPipeline(
 
         var toNotify = await db.NewsArticles
             .Where(x => x.IsRelevant && x.IsAiProcessed && !x.IsNotified)
-            .OrderByDescending(x => x.PublishedAtUtc)
+            .OrderByDescending(x => x.IsHot) // hot news first, so it is never cut off by the digest limit
+            .ThenByDescending(x => x.PublishedAtUtc)
             .Take(DigestMaxArticles)
             .ToListAsync(ct);
 

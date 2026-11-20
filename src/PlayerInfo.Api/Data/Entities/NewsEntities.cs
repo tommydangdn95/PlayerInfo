@@ -12,6 +12,9 @@ public sealed class NewsArticle
     public string? SummaryVi { get; set; }
     public string Category { get; set; } = "Other"; // Injury, Transfer, MatchPerformance, OffPitch, Other
     public bool IsRelevant { get; set; } = true;
+
+    /// <summary>Breaking/major news for a tracked club, as judged by Gemini. Always false without AI.</summary>
+    public bool IsHot { get; set; }
     public bool IsAiProcessed { get; set; }
     public bool IsNotified { get; set; }
     public DateTime PublishedAtUtc { get; set; }

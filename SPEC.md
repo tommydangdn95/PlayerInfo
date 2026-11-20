@@ -178,7 +178,8 @@ Schema is managed by **EF Core migrations** (`Data/Migrations`), applied on star
 | `GET` | `/api/logs?after=&limit=` | Admin JWT | Recent live-log entries after an id (oldest first). In memory only: last 1000 entries of `PlayerInfo.*` categories at Information+, lost on restart. |
 | `GET` | `/api/logs/stream?after=` | Admin JWT | Server-Sent Events: backlog after `after` (or `Last-Event-ID`), then each new entry (`id:` + JSON `data:`), `: ping` heartbeat every 15 s. The UI reads it with `fetch()` to send the JWT. |
 | `GET` | `/api/jobs/quota` | Admin JWT | Today's UTC usage and limits for `ApiFootball` and `NewsData`. |
-| `GET` | `/api/news?category=&page=1&pageSize=20` | Admin JWT | Paginated relevant news articles ordered by `PublishedAtUtc` desc. |
+| `GET` | `/api/news?category=&teamId=&fromUtc=&toUtc=&hot=false&page=1&pageSize=20` | Admin JWT | Relevant news, newest first, with `total`. Each item has `teams` (linked directly or through a linked player). `teamId` filters by team (directly or via its players); `fromUtc`/`toUtc` is a half-open published-at range. `hot=true` returns only Gemini-flagged hot news (`isHot`). `pageSize` max 200. The admin UI "Tin tức" page groups results by Vietnam day or by team. |
+| `GET` | `/api/news/by-team?teamId=&fromUtc=&toUtc=&hot=false&perTeam=3` | Admin JWT | One entry per tracked team (logo, `total`, `hotCount`, newest `perTeam` articles) for the dashboard cards. |
 | `GET` | `/api/news/injuries?limit=30` | Admin JWT | Latest tracked player injuries. |
 | `GET` | `/api/news/transfers?limit=30` | Admin JWT | Latest tracked player transfers. |
 | `GET` | `/api/watchlist/teams` | Admin JWT | All teams, each with its keyword aliases. |
