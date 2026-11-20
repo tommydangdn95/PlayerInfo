@@ -35,6 +35,14 @@ public sealed class CollectorPipeline(
     /// <summary>Max articles offered to one Telegram digest (fewer are sent if the message would be too long).</summary>
     public const int DigestMaxArticles = 15;
 
+    /// <summary>Max stories in one Telegram digest, and the least important story that is pushed.</summary>
+    public const int DigestMaxStories = 10;
+    public const int DigestMinImportance = 3;
+
+    /// <summary>Stories updated within this window are offered to Gemini so new articles can join them.</summary>
+    public static readonly TimeSpan OpenStoryWindow = TimeSpan.FromHours(48);
+    public const int MaxOpenStories = 60;
+
     /// <summary>Articles still not AI-processed after this long are given up on (not retried, not notified).</summary>
     public static readonly TimeSpan PendingAiMaxAge = TimeSpan.FromHours(48);
     public static readonly TimeSpan UntaggedBackfillWindow = TimeSpan.FromDays(30);
@@ -461,7 +469,9 @@ public sealed class CollectorPipeline(
             .OfType<string>()
             .ToHashSet(StringComparer.Ordinal);
 
+        var tiers = await SourceTiers.LoadMatcherAsync(db, ct);
         var added = 0;
+        var junk = 0;
         foreach (var (item, hash, titleKey, tags) in candidates)
         {
             if (existingHashes.Contains(hash) || (titleKey is not null && existingTitleKeys.Contains(titleKey)))
@@ -469,7 +479,7 @@ public sealed class CollectorPipeline(
                 continue;
             }
 
-            db.NewsArticles.Add(new NewsArticle
+            var article = new NewsArticle
             {
                 UrlHash = hash,
                 Url = item.Url,
@@ -478,8 +488,18 @@ public sealed class CollectorPipeline(
                 SourceName = item.SourceName.Length > 150 ? item.SourceName[..150] : item.SourceName,
                 Language = item.Language,
                 PublishedAtUtc = item.PublishedAtUtc,
+                SourceTier = tiers.Match(item.SourceName, item.Url),
                 Entities = tags.Select(t => new ArticleEntity { EntityType = t.Type, EntityId = t.Id }).ToList()
-            });
+            };
+
+            if (article.SourceTier == SourceTiers.Junk)
+            {
+                // Betting/tipping sites: kept only so they are not fetched again; hidden and never sent to Gemini.
+                SourceTiers.HideAsJunk(article);
+                junk++;
+            }
+
+            db.NewsArticles.Add(article);
             added++;
         }
 
@@ -488,7 +508,8 @@ public sealed class CollectorPipeline(
             await db.SaveChangesAsync(ct);
         }
 
-        logger.LogInformation("Ingested {Raw} raw items, saved {Added} new unique articles", rawItems.Count, added);
+        logger.LogInformation("Ingested {Raw} raw items, saved {Added} new unique articles ({Junk} from junk sources, hidden)",
+            rawItems.Count, added, junk);
 
         await TagUntaggedRecentArticlesAsync(matcher, ct);
     }
@@ -598,7 +619,10 @@ public sealed class CollectorPipeline(
                     .ToListAsync(ct))
                 .ToLookup(e => e.ArticleId, e => (e.EntityType, e.EntityId));
 
-            var batch = await gemini.EnrichBatchAsync(chunk, trackedNames, ct);
+            // Re-read for every chunk: the previous chunk may have opened new stories.
+            var openStories = await LoadOpenStoriesAsync(teams, ct);
+
+            var batch = await gemini.EnrichBatchAsync(chunk, trackedNames, openStories, ct);
             if (!batch.Succeeded)
             {
                 // Leave these (and the remaining chunks) unprocessed so a later run retries them;
@@ -611,6 +635,12 @@ public sealed class CollectorPipeline(
             var resultMap = batch.Articles
                 .GroupBy(r => r.ArticleId)
                 .ToDictionary(g => g.Key, g => g.First());
+            var storyResults = batch.Stories
+                .Where(st => !string.IsNullOrWhiteSpace(st.Ref))
+                .GroupBy(st => st.Ref.Trim(), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+            var openIds = openStories.Select(o => o.Id).ToHashSet();
+            var storiesByRef = new Dictionary<string, Story>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var art in chunk)
             {
@@ -620,17 +650,140 @@ public sealed class CollectorPipeline(
                     continue;
                 }
 
-                art.IsRelevant = r.IsRelevant;
-                art.IsHot = r.IsRelevant && r.IsHot;
-                art.Category = NormalizeCategory(r.Category);
+                art.IsRelevant = r.IsRelevant && art.SourceTier != SourceTiers.Junk;
+                art.Category = NewsTaxonomy.NormalizeTopic(r.Topic);
+                art.ClaimType = NewsTaxonomy.NormalizeClaimType(r.ClaimType);
+                art.Importance = NewsTaxonomy.NormalizeImportance(r.Importance);
+                art.IsHot = art.IsRelevant && art.Importance >= NewsTaxonomy.HotImportance;
                 art.SummaryVi = string.IsNullOrWhiteSpace(r.SummaryVi) ? null : r.SummaryVi.Trim();
                 art.IsAiProcessed = true;
                 LinkMatchedEntities(art, r.MatchedEntities ?? [], teams, players, existingLinks[art.Id]);
+
+                if (art.IsRelevant)
+                {
+                    art.Story = await ResolveStoryAsync(art, r.StoryRef, openIds, storiesByRef, ct);
+                }
+            }
+
+            foreach (var (storyRef, story) in storiesByRef)
+            {
+                if (storyResults.TryGetValue(storyRef, out var st))
+                {
+                    if (!string.IsNullOrWhiteSpace(st.HeadlineVi))
+                    {
+                        story.HeadlineVi = Truncate(st.HeadlineVi.Trim(), 300);
+                    }
+
+                    story.SummaryVi = string.IsNullOrWhiteSpace(st.SummaryVi) ? story.SummaryVi : st.SummaryVi.Trim();
+                    story.Topic = NewsTaxonomy.NormalizeTopic(st.Topic);
+                    story.Importance = NewsTaxonomy.NormalizeImportance(st.Importance);
+                }
+
+                story.LastUpdatedUtc = DateTime.UtcNow;
             }
 
             await db.SaveChangesAsync(ct);
+            await RescoreStoriesAsync(storiesByRef.Values.Select(st => st.Id).ToList(), ct);
         }
     }
+
+    /// <summary>Recent stories, with the tracked teams their articles are about, for Gemini to attach new articles to.</summary>
+    private async Task<List<OpenStory>> LoadOpenStoriesAsync(IReadOnlyList<Team> teams, CancellationToken ct)
+    {
+        var since = DateTime.UtcNow - OpenStoryWindow;
+        var stories = await db.Stories.AsNoTracking()
+            .Where(st => st.LastUpdatedUtc >= since)
+            .OrderByDescending(st => st.LastUpdatedUtc)
+            .Take(MaxOpenStories)
+            .Select(st => new { st.Id, st.Topic, st.HeadlineVi, st.SummaryVi })
+            .ToListAsync(ct);
+        if (stories.Count == 0)
+        {
+            return [];
+        }
+
+        var ids = stories.Select(st => st.Id).ToList();
+        var teamLinks = await db.NewsArticles.AsNoTracking()
+            .Where(a => a.StoryId != null && ids.Contains(a.StoryId.Value))
+            .SelectMany(a => a.Entities.Where(e => e.EntityType == "Team"), (a, e) => new { StoryId = a.StoryId!.Value, e.EntityId })
+            .Distinct()
+            .ToListAsync(ct);
+        var teamNames = teams.ToDictionary(t => t.Id, t => t.Name);
+        var teamsByStory = teamLinks
+            .Where(l => teamNames.ContainsKey(l.EntityId))
+            .ToLookup(l => l.StoryId, l => teamNames[l.EntityId]);
+
+        return stories
+            .Select(st => new OpenStory(st.Id, string.Join(", ", teamsByStory[st.Id].Distinct()), st.Topic, st.HeadlineVi, st.SummaryVi))
+            .ToList();
+    }
+
+    /// <summary>
+    /// The story Gemini put the article in: an open story ("S12"), a story new in this batch ("N1", shared by
+    /// the batch's articles about the same news), or, when Gemini gave nothing usable, a story of its own.
+    /// </summary>
+    private async Task<Story> ResolveStoryAsync(
+        NewsArticle article,
+        string? storyRef,
+        HashSet<long> openIds,
+        Dictionary<string, Story> storiesByRef,
+        CancellationToken ct)
+    {
+        var key = storyRef?.Trim() ?? string.Empty;
+        if (key.Length > 1 && (key[0] is 'S' or 's') && long.TryParse(key[1..], out var id) && openIds.Contains(id))
+        {
+            key = $"S{id}";
+            if (!storiesByRef.TryGetValue(key, out var open))
+            {
+                open = (await db.Stories.FindAsync([id], ct))!;
+                storiesByRef[key] = open;
+            }
+
+            return open;
+        }
+
+        if (key.Length == 0 || key[0] is 'S' or 's')
+        {
+            key = $"A{article.Id}"; // unknown or missing reference: its own story
+        }
+
+        if (!storiesByRef.TryGetValue(key, out var story))
+        {
+            story = new Story
+            {
+                HeadlineVi = Truncate(article.SummaryVi ?? article.Title, 300),
+                SummaryVi = article.SummaryVi,
+                Topic = article.Category,
+                Importance = Math.Max(1, article.Importance),
+                FirstSeenUtc = DateTime.UtcNow
+            };
+            db.Stories.Add(story);
+            storiesByRef[key] = story;
+        }
+
+        return story;
+    }
+
+    /// <summary>Recomputes confidence, source count and best tier of stories from all their articles.</summary>
+    private async Task RescoreStoriesAsync(List<long> storyIds, CancellationToken ct)
+    {
+        if (storyIds.Count == 0)
+        {
+            return;
+        }
+
+        var stories = await db.Stories.Where(st => storyIds.Contains(st.Id)).ToListAsync(ct);
+        var articles = (await db.NewsArticles.Where(a => a.StoryId != null && storyIds.Contains(a.StoryId.Value)).ToListAsync(ct))
+            .ToLookup(a => a.StoryId!.Value);
+        foreach (var story in stories)
+        {
+            NewsTaxonomy.Rescore(story, articles[story.Id].ToList());
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+
+    private static string Truncate(string value, int max) => value.Length > max ? value[..max] : value;
 
     private async Task GiveUpOnStalePendingArticlesAsync(CancellationToken ct)
     {
@@ -654,10 +807,6 @@ public sealed class CollectorPipeline(
         await db.SaveChangesAsync(ct);
         logger.LogWarning("Gave up AI processing for {Count} articles pending longer than {MaxAge}", stale.Count, PendingAiMaxAge);
     }
-
-    internal static string NormalizeCategory(string? category)
-        => GeminiEnricherClient.Categories.FirstOrDefault(c => string.Equals(c, category?.Trim(), StringComparison.OrdinalIgnoreCase))
-           ?? "Other";
 
     private void LinkMatchedEntities(
         NewsArticle article,
@@ -704,9 +853,16 @@ public sealed class CollectorPipeline(
             return;
         }
 
+        if (gemini.IsConfigured)
+        {
+            await NotifyStoriesAsync(modeLabel, ct);
+            return;
+        }
+
+        // Without AI there are no stories: push the newest articles as before.
         var toNotify = await db.NewsArticles
             .Where(x => x.IsRelevant && x.IsAiProcessed && !x.IsNotified)
-            .OrderByDescending(x => x.IsHot) // hot news first, so it is never cut off by the digest limit
+            .OrderByDescending(x => x.IsHot)
             .ThenByDescending(x => x.PublishedAtUtc)
             .Take(DigestMaxArticles)
             .ToListAsync(ct);
@@ -728,5 +884,70 @@ public sealed class CollectorPipeline(
         }
 
         logger.LogInformation("Telegram digest: {Delivered}/{Candidates} articles delivered", delivered, toNotify.Count);
+    }
+
+    /// <summary>
+    /// Pushes stories that are new or were updated since they were last pushed (e.g. a rumour that became official),
+    /// most important first, each with its best source.
+    /// </summary>
+    private async Task NotifyStoriesAsync(string modeLabel, CancellationToken ct)
+    {
+        var since = DateTime.UtcNow - TimeSpan.FromHours(24);
+        var stories = await db.Stories
+            .Where(st => st.LastUpdatedUtc >= since && st.Importance >= DigestMinImportance &&
+                         (st.NotifiedAtUtc == null || st.NotifiedAtUtc < st.LastUpdatedUtc))
+            .OrderByDescending(st => st.Importance)
+            .ThenByDescending(st => st.SourceCount)
+            .ThenByDescending(st => st.LastUpdatedUtc)
+            .Take(DigestMaxStories)
+            .ToListAsync(ct);
+
+        if (stories.Count == 0)
+        {
+            return;
+        }
+
+        var ids = stories.Select(st => st.Id).ToList();
+        var articles = (await db.NewsArticles
+                .Where(a => a.StoryId != null && ids.Contains(a.StoryId.Value) && a.IsRelevant)
+                .Include(a => a.Entities)
+                .ToListAsync(ct))
+            .ToLookup(a => a.StoryId!.Value);
+        var teamNames = await db.Teams.AsNoTracking().ToDictionaryAsync(t => t.Id, t => t.Name, ct);
+
+        var items = stories.Select(st =>
+        {
+            var storyArticles = articles[st.Id].ToList();
+            var best = storyArticles
+                .OrderBy(a => a.SourceTier == SourceTiers.Junk ? 9 : a.SourceTier)
+                .ThenByDescending(a => a.PublishedAtUtc)
+                .FirstOrDefault();
+            var teams = storyArticles
+                .SelectMany(a => a.Entities)
+                .Where(e => e.EntityType == "Team" && teamNames.ContainsKey(e.EntityId))
+                .Select(e => teamNames[e.EntityId])
+                .Distinct()
+                .Order()
+                .ToList();
+            return new StoryDigestItem(st, teams, best?.Url, best?.SourceName);
+        }).ToList();
+
+        var delivered = await telegram.SendStoryDigestAsync(items, modeLabel, ct);
+        var now = DateTime.UtcNow;
+        foreach (var item in items.Take(delivered))
+        {
+            item.Story.NotifiedAtUtc = now;
+            foreach (var art in articles[item.Story.Id])
+            {
+                art.IsNotified = true;
+            }
+        }
+
+        if (delivered > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        logger.LogInformation("Telegram digest: {Delivered}/{Candidates} stories delivered", delivered, items.Count);
     }
 }

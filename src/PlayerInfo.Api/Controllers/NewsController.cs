@@ -20,16 +20,11 @@ public sealed class NewsController(AppDbContext db) : ControllerBase
         string Url,
         DateTime PublishedAtUtc,
         bool IsHot,
+        int Importance,
+        string? ClaimType,
+        int SourceTier,
+        long? StoryId,
         IReadOnlyList<ArticleTeamDto> Teams);
-
-    public sealed record TeamNewsDto(
-        int Id,
-        string Name,
-        string? LogoUrl,
-        string? LeagueSlug,
-        int Total,
-        int HotCount,
-        IReadOnlyList<ArticleDto> Items);
 
     /// <summary>
     /// Relevant articles, newest first. Each article carries the teams it is about: teams linked directly,
@@ -70,71 +65,6 @@ public sealed class NewsController(AppDbContext db) : ControllerBase
 
         var items = await LoadArticlesAsync(ids, ct);
         return Ok(new { page, pageSize, total, items });
-    }
-
-    /// <summary>
-    /// One entry per tracked team (or only <paramref name="teamId"/>), with its logo, how many articles
-    /// match the filters, how many of them are hot, and the newest <paramref name="perTeam"/> of them.
-    /// </summary>
-    [HttpGet("by-team")]
-    public async Task<IActionResult> GetByTeamAsync(
-        [FromQuery] int? teamId = null,
-        [FromQuery] DateTime? fromUtc = null,
-        [FromQuery] DateTime? toUtc = null,
-        [FromQuery] bool hot = false,
-        [FromQuery] int perTeam = 3,
-        CancellationToken ct = default)
-    {
-        perTeam = Math.Clamp(perTeam, 1, 20);
-
-        var teams = await db.Teams.AsNoTracking()
-            .Where(t => t.IsTracked && (teamId == null || t.Id == teamId))
-            .OrderBy(t => t.Name)
-            .ToListAsync(ct);
-        var teamIds = teams.Select(t => t.Id).ToList();
-
-        var playerTeam = await db.Players.AsNoTracking()
-            .Where(p => p.TeamId != null && teamIds.Contains(p.TeamId.Value))
-            .ToDictionaryAsync(p => p.Id, p => p.TeamId!.Value, ct);
-        var playerIds = playerTeam.Keys.ToList();
-
-        // Every (article, team) pair in range, then grouped in memory: a handful of queries in total
-        // instead of several per team.
-        var links = await Filter(null, fromUtc, toUtc, hot)
-            .SelectMany(a => a.Entities, (a, e) => new { a.Id, a.PublishedAtUtc, a.IsHot, e.EntityType, e.EntityId })
-            .Where(x => (x.EntityType == "Team" && teamIds.Contains(x.EntityId)) ||
-                        (x.EntityType == "Player" && playerIds.Contains(x.EntityId)))
-            .ToListAsync(ct);
-
-        var byTeam = links
-            .Select(l => new
-            {
-                l.Id,
-                l.PublishedAtUtc,
-                l.IsHot,
-                TeamId = l.EntityType == "Team" ? l.EntityId : playerTeam[l.EntityId]
-            })
-            .DistinctBy(l => (l.Id, l.TeamId))
-            .GroupBy(l => l.TeamId)
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(l => l.PublishedAtUtc).ThenByDescending(l => l.Id).ToList());
-
-        var topIds = byTeam.Values.SelectMany(list => list.Take(perTeam).Select(l => l.Id)).Distinct().ToList();
-        var articles = (await LoadArticlesAsync(topIds, ct)).ToDictionary(a => a.Id);
-
-        var result = teams.Select(t =>
-        {
-            var list = byTeam.GetValueOrDefault(t.Id) ?? [];
-            return new TeamNewsDto(
-                t.Id,
-                t.Name,
-                t.LogoUrl,
-                t.LeagueSlug,
-                list.Count,
-                list.Count(l => l.IsHot),
-                list.Take(perTeam).Select(l => articles[l.Id]).ToList());
-        }).ToList();
-
-        return Ok(result);
     }
 
     [HttpGet("injuries")]
@@ -202,7 +132,7 @@ public sealed class NewsController(AppDbContext db) : ControllerBase
 
         var rows = await db.NewsArticles.AsNoTracking()
             .Where(x => ids.Contains(x.Id))
-            .Select(x => new { x.Id, x.Title, x.SummaryVi, x.Category, x.SourceName, x.Url, x.PublishedAtUtc, x.IsHot })
+            .Select(x => new { x.Id, x.Title, x.SummaryVi, x.Category, x.SourceName, x.Url, x.PublishedAtUtc, x.IsHot, x.Importance, x.ClaimType, x.SourceTier, x.StoryId })
             .ToListAsync(ct);
 
         var teamsByArticle = await LoadArticleTeamsAsync(ids, ct);
@@ -210,6 +140,7 @@ public sealed class NewsController(AppDbContext db) : ControllerBase
             .OrderByDescending(r => r.PublishedAtUtc)
             .ThenByDescending(r => r.Id)
             .Select(r => new ArticleDto(r.Id, r.Title, r.SummaryVi, r.Category, r.SourceName, r.Url, r.PublishedAtUtc, r.IsHot,
+                r.Importance, r.ClaimType, r.SourceTier, r.StoryId,
                 teamsByArticle.TryGetValue(r.Id, out var teams) ? teams : []))
             .ToList();
     }

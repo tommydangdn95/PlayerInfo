@@ -4,24 +4,41 @@ using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Data.Entities;
+using PlayerInfo.Api.Services;
 
 namespace PlayerInfo.Api.Clients;
 
 public sealed record GeminiArticleResult(
     [property: JsonPropertyName("articleId")] long ArticleId,
     [property: JsonPropertyName("isRelevant")] bool IsRelevant,
-    [property: JsonPropertyName("category")] string? Category,
+    [property: JsonPropertyName("topic")] string? Topic,
+    [property: JsonPropertyName("claimType")] string? ClaimType,
+    [property: JsonPropertyName("importance")] int Importance,
     [property: JsonPropertyName("summaryVi")] string? SummaryVi,
     [property: JsonPropertyName("matchedEntities")] List<string>? MatchedEntities,
-    [property: JsonPropertyName("isHot")] bool IsHot = false);
+    [property: JsonPropertyName("storyRef")] string? StoryRef);
+
+/// <summary>Latest state of a story (new label "N1".., or existing "S{id}") after this batch.</summary>
+public sealed record GeminiStoryResult(
+    [property: JsonPropertyName("ref")] string Ref,
+    [property: JsonPropertyName("headlineVi")] string? HeadlineVi,
+    [property: JsonPropertyName("summaryVi")] string? SummaryVi,
+    [property: JsonPropertyName("topic")] string? Topic,
+    [property: JsonPropertyName("importance")] int Importance);
+
+/// <summary>A recent story offered to Gemini so new articles about the same news join it.</summary>
+public sealed record OpenStory(long Id, string Teams, string Topic, string HeadlineVi, string? SummaryVi)
+{
+    public string Ref => $"S{Id}";
+}
 
 /// <summary>
 /// Outcome of one Gemini batch. <see cref="Succeeded"/> is false when the call failed
 /// (HTTP error, timeout, unparsable output), so the caller can retry those articles later.
 /// </summary>
-public sealed record GeminiBatchResult(bool Succeeded, IReadOnlyList<GeminiArticleResult> Articles)
+public sealed record GeminiBatchResult(bool Succeeded, IReadOnlyList<GeminiArticleResult> Articles, IReadOnlyList<GeminiStoryResult> Stories)
 {
-    public static readonly GeminiBatchResult Failed = new(false, []);
+    public static readonly GeminiBatchResult Failed = new(false, [], []);
 }
 
 /// <summary>
@@ -33,33 +50,58 @@ public sealed class GeminiEnricherClient(
     IOptions<CollectorOptions> collectorOptions,
     ILogger<GeminiEnricherClient> logger)
 {
-    public static readonly IReadOnlyList<string> Categories = ["Injury", "Transfer", "MatchPerformance", "OffPitch", "Other"];
-
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
     /// <summary>
-    /// Structured-output schema so Gemini returns exactly a JSON array of article results.
+    /// Structured-output schema: one result per article plus the stories they belong to.
     /// </summary>
     private static readonly object ResponseSchema = new
     {
-        type = "ARRAY",
-        items = new
+        type = "OBJECT",
+        properties = new Dictionary<string, object>
         {
-            type = "OBJECT",
-            properties = new Dictionary<string, object>
+            ["articles"] = new
             {
-                ["articleId"] = new { type = "INTEGER" },
-                ["isRelevant"] = new { type = "BOOLEAN" },
-                ["category"] = new { type = "STRING", @enum = Categories },
-                ["summaryVi"] = new { type = "STRING" },
-                ["matchedEntities"] = new { type = "ARRAY", items = new { type = "STRING" } },
-                ["isHot"] = new { type = "BOOLEAN" }
+                type = "ARRAY",
+                items = new
+                {
+                    type = "OBJECT",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["articleId"] = new { type = "INTEGER" },
+                        ["isRelevant"] = new { type = "BOOLEAN" },
+                        ["topic"] = new { type = "STRING", @enum = NewsTaxonomy.Topics },
+                        ["claimType"] = new { type = "STRING", @enum = NewsTaxonomy.ClaimTypes },
+                        ["importance"] = new { type = "INTEGER" },
+                        ["summaryVi"] = new { type = "STRING" },
+                        ["matchedEntities"] = new { type = "ARRAY", items = new { type = "STRING" } },
+                        ["storyRef"] = new { type = "STRING" }
+                    },
+                    required = new[] { "articleId", "isRelevant", "topic", "claimType", "importance", "summaryVi", "matchedEntities", "storyRef" }
+                }
             },
-            required = new[] { "articleId", "isRelevant", "category", "summaryVi", "matchedEntities", "isHot" }
-        }
+            ["stories"] = new
+            {
+                type = "ARRAY",
+                items = new
+                {
+                    type = "OBJECT",
+                    properties = new Dictionary<string, object>
+                    {
+                        ["ref"] = new { type = "STRING" },
+                        ["headlineVi"] = new { type = "STRING" },
+                        ["summaryVi"] = new { type = "STRING" },
+                        ["topic"] = new { type = "STRING", @enum = NewsTaxonomy.Topics },
+                        ["importance"] = new { type = "INTEGER" }
+                    },
+                    required = new[] { "ref", "headlineVi", "summaryVi", "topic", "importance" }
+                }
+            }
+        },
+        required = new[] { "articles", "stories" }
     };
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(apiKeys.Value.Gemini);
@@ -67,6 +109,7 @@ public sealed class GeminiEnricherClient(
     public async Task<GeminiBatchResult> EnrichBatchAsync(
         IReadOnlyList<NewsArticle> batch,
         IReadOnlyList<string> trackedEntityNames,
+        IReadOnlyList<OpenStory> openStories,
         CancellationToken ct = default)
     {
         if (!IsConfigured || batch.Count == 0)
@@ -78,7 +121,7 @@ public sealed class GeminiEnricherClient(
         {
             contents = new[]
             {
-                new { parts = new[] { new { text = BuildPrompt(batch, trackedEntityNames) } } }
+                new { parts = new[] { new { text = BuildPrompt(batch, trackedEntityNames, openStories) } } }
             },
             generationConfig = new
             {
@@ -88,30 +131,27 @@ public sealed class GeminiEnricherClient(
             }
         };
 
-        string? jsonText;
-        try
+        var body = JsonSerializer.Serialize(payload);
+        string? jsonText = null;
+        var answered = false;
+        foreach (var model in collectorOptions.Value.GeminiModels())
         {
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"v1beta/models/{collectorOptions.Value.GeminiModel}:generateContent")
+            var (ok, retryElsewhere, text) = await SendAsync(model, body, batch.Count, ct);
+            if (ok)
             {
-                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
-            };
-            // Key in a header rather than the query string so it never ends up in URLs/logs.
-            req.Headers.TryAddWithoutValidation("x-goog-api-key", apiKeys.Value.Gemini);
-
-            using var res = await http.SendAsync(req, ct);
-            if (!res.IsSuccessStatusCode)
-            {
-                var errBody = await res.Content.ReadAsStringAsync(ct);
-                logger.LogWarning("Gemini API returned {StatusCode}: {Body}", res.StatusCode, errBody);
-                return GeminiBatchResult.Failed;
+                jsonText = text;
+                answered = true;
+                break;
             }
 
-            var responseDoc = await res.Content.ReadFromJsonAsync<GeminiGenerateResponse>(JsonOptions, ct);
-            jsonText = responseDoc?.Candidates?.FirstOrDefault()?.Content?.Parts?.FirstOrDefault()?.Text;
+            if (!retryElsewhere)
+            {
+                break;
+            }
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
+
+        if (!answered)
         {
-            logger.LogWarning(ex, "Gemini request failed for a batch of {Count} articles", batch.Count);
             return GeminiBatchResult.Failed;
         }
 
@@ -123,8 +163,14 @@ public sealed class GeminiEnricherClient(
 
         try
         {
-            var parsed = JsonSerializer.Deserialize<List<GeminiArticleResult>>(jsonText, JsonOptions);
-            return new GeminiBatchResult(true, parsed ?? []);
+            var parsed = JsonSerializer.Deserialize<GeminiOutput>(jsonText, JsonOptions);
+            if (parsed?.Articles is null)
+            {
+                logger.LogWarning("Gemini JSON output has no articles: {Raw}", jsonText);
+                return GeminiBatchResult.Failed;
+            }
+
+            return new GeminiBatchResult(true, parsed.Articles, parsed.Stories ?? []);
         }
         catch (JsonException ex)
         {
@@ -133,23 +179,85 @@ public sealed class GeminiEnricherClient(
         }
     }
 
-    private static string BuildPrompt(IReadOnlyList<NewsArticle> batch, IReadOnlyList<string> trackedEntities)
+    /// <summary>
+    /// Calls one model. Overload, rate limits, retired models (404) and timeouts are worth trying on the next
+    /// model; bad requests and auth errors are not.
+    /// </summary>
+    private async Task<(bool Ok, bool RetryElsewhere, string? Text)> SendAsync(string model, string body, int batchCount, CancellationToken ct)
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"v1beta/models/{model}:generateContent")
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            };
+            // Key in a header rather than the query string so it never ends up in URLs/logs.
+            req.Headers.TryAddWithoutValidation("x-goog-api-key", apiKeys.Value.Gemini);
+
+            using var res = await http.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                var errBody = await res.Content.ReadAsStringAsync(ct);
+                var status = (int)res.StatusCode;
+                var retry = status is 404 or 429 or >= 500;
+                logger.LogWarning("Gemini model {Model} returned {StatusCode}{Next}: {Body}",
+                    model, res.StatusCode, retry ? ", trying the next model" : string.Empty, errBody);
+                return (false, retry, null);
+            }
+
+            var responseDoc = await res.Content.ReadFromJsonAsync<GeminiGenerateResponse>(JsonOptions, ct);
+            return (true, false, responseDoc?.Candidates?.FirstOrDefault()?.Content?.Parts?.FirstOrDefault()?.Text);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Gemini model {Model} request failed for a batch of {Count} articles", model, batchCount);
+            return (false, true, null);
+        }
+    }
+
+    internal static string BuildPrompt(IReadOnlyList<NewsArticle> batch, IReadOnlyList<string> trackedEntities, IReadOnlyList<OpenStory> openStories)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("You are a football news analyst. Analyze the following news articles and return ONLY a JSON array with one object per article.");
-        sb.AppendLine("Each object in the array must have:");
-        sb.AppendLine("- articleId (number, copied from ID)");
-        sb.AppendLine("- isRelevant (boolean: false if clickbait, betting spam, or unrelated to football)");
-        sb.AppendLine($"- category (one of: {string.Join(", ", Categories)})");
-        sb.AppendLine("- summaryVi (concise 1-2 sentence summary in Vietnamese)");
-        sb.AppendLine("- matchedEntities (array of tracked team/player names from the list below that the article is about, using the exact spelling from the list)");
-        sb.AppendLine("- isHot (boolean: true ONLY for important, newsworthy news about a tracked team/player that a fan must not miss:");
-        sb.AppendLine("  a confirmed or advanced transfer, a significant injury or return of a key player, a manager sacked/appointed,");
-        sb.AppendLine("  a final match result or major upset, a suspension/disciplinary decision, an official club announcement.");
-        sb.AppendLine("  false for previews, predictions, opinion, gossip round-ups, betting tips, fan reactions, minor or old news.");
-        sb.AppendLine("  At most about 1 in 5 articles should be hot.)");
+        sb.AppendLine("You are the editor of a Vietnamese football news service. Analyze the articles below and return ONLY JSON: {\"articles\": [...], \"stories\": [...]}.");
+        sb.AppendLine();
+        sb.AppendLine("For EVERY article, one object in \"articles\":");
+        sb.AppendLine("- articleId: copied from ID");
+        sb.AppendLine("- isRelevant: false for betting/odds/tips, fantasy-football advice, quizzes, clickbait, or news not about football or not about the tracked teams/players");
+        sb.AppendLine("- topic, one of:");
+        sb.AppendLine("  Transfer (signings, sales, loans, contracts), Injury (injuries, returns, fitness, squad availability),");
+        sb.AppendLine("  Match (results, match reports, performances), PreMatch (previews, predicted line-ups, pre-match press conferences),");
+        sb.AppendLine("  Manager (coach/staff: appointments, sackings, statements), Turmoil (internal problems, rifts, unrest, crisis, bad run),");
+        sb.AppendLine("  Discipline (cards, bans, charges, investigations), Club (ownership, finances, stadium, business), Other");
+        sb.AppendLine("- claimType: Official (announced/confirmed by the club, league or player; final match results), Report (stated as fact by the journalist),");
+        sb.AppendLine("  Rumour (speculation: 'linked with', 'eyeing', 'could', gossip columns), Opinion (columns, analysis, predictions, fan views)");
+        sb.AppendLine("- importance 1-5 for fans of the tracked team: 5 must-know (completed transfer, manager sacked/appointed, long injury to a key player, big result),");
+        sb.AppendLine("  4 significant, 3 notable, 2 minor, 1 filler/trivia");
+        sb.AppendLine("- summaryVi: 1-2 sentence Vietnamese summary of the article");
+        sb.AppendLine("- matchedEntities: tracked team/player names (exact spelling from the list) the article is about");
+        sb.AppendLine("- storyRef: the story it belongs to. A story is ONE piece of news (same event, same people) reported by several articles.");
+        sb.AppendLine("  Use an open story id (e.g. \"S12\") if the article reports the same news; otherwise a new label \"N1\", \"N2\"...");
+        sb.AppendLine("  shared by all articles of this batch about the same news. Use \"\" for irrelevant articles.");
+        sb.AppendLine();
+        sb.AppendLine("For every story used by a relevant article (new labels and open ids that got new articles), one object in \"stories\":");
+        sb.AppendLine("- ref: the label or id");
+        sb.AppendLine("- headlineVi: short factual Vietnamese headline (max 15 words, no clickbait)");
+        sb.AppendLine("- summaryVi: 2-3 Vietnamese sentences combining everything known so far (the open story's summary plus new details);");
+        sb.AppendLine("  say clearly if it is still only a rumour");
+        sb.AppendLine("- topic and importance for the story as a whole");
         sb.AppendLine();
         sb.AppendLine($"Tracked entities: {string.Join(", ", trackedEntities)}");
+        sb.AppendLine();
+        sb.AppendLine("Open stories (last 48 hours):");
+        if (openStories.Count == 0)
+        {
+            sb.AppendLine("- (none)");
+        }
+
+        foreach (var s in openStories)
+        {
+            sb.AppendLine($"- {s.Ref} | {s.Teams} | {s.Topic} | {s.HeadlineVi} | {s.SummaryVi}");
+        }
+
         sb.AppendLine();
         sb.AppendLine("Articles:");
         foreach (var a in batch)
@@ -160,6 +268,7 @@ public sealed class GeminiEnricherClient(
         return sb.ToString();
     }
 
+    private sealed record GeminiOutput(List<GeminiArticleResult>? Articles, List<GeminiStoryResult>? Stories);
     private sealed record GeminiGenerateResponse(List<GeminiCandidate>? Candidates);
     private sealed record GeminiCandidate(GeminiContent? Content);
     private sealed record GeminiContent(List<GeminiPart>? Parts);

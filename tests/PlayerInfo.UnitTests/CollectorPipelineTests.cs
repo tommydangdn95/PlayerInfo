@@ -18,9 +18,20 @@ public sealed class CollectorPipelineTests
         return team;
     }
 
-    private static string GeminiFor(long articleId, string matched = "\"Arsenal\"", bool relevant = true, bool hot = false)
-        => TestDbFactory.GeminiResponse(
-            $$"""[{"articleId":{{articleId}},"isRelevant":{{(relevant ? "true" : "false")}},"category":"matchperformance","summaryVi":"Arsenal thắng trận derby.","matchedEntities":[{{matched}}],"isHot":{{(hot ? "true" : "false")}}}]""");
+    private static string GeminiFor(long articleId, string matched = "\"Arsenal\"", bool relevant = true, bool hot = false, string storyRef = "N1")
+        => GeminiForMany([articleId], matched, relevant, hot ? 5 : 2, storyRef);
+
+    /// <summary>Gemini output putting all <paramref name="articleIds"/> in one story.</summary>
+    private static string GeminiForMany(
+        long[] articleIds, string matched = "\"Arsenal\"", bool relevant = true, int importance = 2, string storyRef = "N1", string claim = "Report")
+    {
+        var articles = string.Join(",", articleIds.Select(id =>
+            $$"""{"articleId":{{id}},"isRelevant":{{(relevant ? "true" : "false")}},"topic":"match","claimType":"{{claim}}","importance":{{importance}},"summaryVi":"Arsenal thắng trận derby.","matchedEntities":[{{matched}}],"storyRef":"{{storyRef}}"}"""));
+        var stories = relevant
+            ? $$"""{"ref":"{{storyRef}}","headlineVi":"Arsenal thắng derby","summaryVi":"Arsenal thắng Tottenham 2-1.","topic":"Match","importance":{{importance}}}"""
+            : string.Empty;
+        return TestDbFactory.GeminiResponse($$"""{"articles":[{{articles}}],"stories":[{{stories}}]}""");
+    }
 
     [Fact]
     public async Task RunAsync_NewsMode_DeduplicatesUrlsAndLinksMatchedTeams()
@@ -53,7 +64,7 @@ public sealed class CollectorPipelineTests
 
         var newArticle = allArticles.Single(a => a.Url == "https://bbc.com/arsenal-derby");
         Assert.True(newArticle.IsAiProcessed);
-        Assert.Equal("MatchPerformance", newArticle.Category); // normalized casing
+        Assert.Equal("Match", newArticle.Category); // normalized casing
         Assert.Equal("Arsenal thắng trận derby.", newArticle.SummaryVi);
         Assert.Equal(team.Id, Assert.Single(newArticle.Entities).EntityId);
         Assert.False(newArticle.IsHot);
@@ -248,10 +259,12 @@ public sealed class CollectorPipelineTests
 
     [Theory]
     [InlineData("transfer", "Transfer")]
+    [InlineData("MatchPerformance", "Match")]
+    [InlineData("OffPitch", "Other")]
     [InlineData("Gossip", "Other")]
     [InlineData(null, "Other")]
-    public void NormalizeCategory_MapsToKnownCategories(string? input, string expected)
-        => Assert.Equal(expected, CollectorPipeline.NormalizeCategory(input));
+    public void NormalizeTopic_MapsToKnownTopics(string? input, string expected)
+        => Assert.Equal(expected, NewsTaxonomy.NormalizeTopic(input));
 
     // ---------------------------------------------------------------- ESPN steps
 
@@ -377,5 +390,140 @@ public sealed class CollectorPipelineTests
         var articles = await read.NewsArticles.Include(a => a.Entities).ToListAsync();
         Assert.Equal([arsenal.Id, chelsea.Id], articles.Single(a => a.Url == "https://bbc.com/preview").Entities.Select(e => e.EntityId).Order());
         Assert.Equal(chelsea.Id, Assert.Single(articles.Single(a => a.Url == "https://x.com/old").Entities).EntityId);
+    }
+
+    // ---------------------------------------------------------------- stories & source tiers
+
+    [Fact]
+    public async Task RunAsync_News_GroupsArticlesAboutTheSameNewsIntoOneStory()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss(
+            ("Arsenal beat Spurs 2-1", "https://a.com/1"),
+            ("Saka scores as Arsenal win the derby", "https://b.com/2")));
+        h.Gemini = _ => TestDbFactory.JsonResponse(GeminiForMany([1, 2], importance: 4));
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        var story = await read.Stories.Include(st => st.Articles).SingleAsync();
+        Assert.Equal(("Arsenal thắng derby", "Arsenal thắng Tottenham 2-1.", "Match", 4), (story.HeadlineVi, story.SummaryVi, story.Topic, story.Importance));
+        Assert.Equal(2, story.Articles.Count);
+        Assert.All(story.Articles, a => Assert.Equal(("Report", 4, true), (a.ClaimType, a.Importance, a.IsHot)));
+        Assert.Equal(1, story.SourceCount); // both from the same feed
+    }
+
+    [Fact]
+    public async Task RunAsync_News_AttachesNewArticleToOpenStory_AndUpdatesIt()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        var open = new Story { HeadlineVi = "Cũ", Topic = "Match", Importance = 2, FirstSeenUtc = DateTime.UtcNow.AddHours(-5), LastUpdatedUtc = DateTime.UtcNow.AddHours(-5) };
+        h.Db.Stories.Add(open);
+        await h.Db.SaveChangesAsync();
+        var lastUpdatedBefore = open.LastUpdatedUtc;
+        string? prompt = null;
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss(("Arsenal derby: more reaction", "https://c.com/3")));
+        h.Gemini = req =>
+        {
+            prompt = req.Content!.ReadAsStringAsync().Result;
+            return TestDbFactory.JsonResponse(GeminiFor(1, storyRef: $"S{open.Id}"));
+        };
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        Assert.Contains($"S{open.Id} |", prompt);
+        await using var read = h.NewContext();
+        var story = await read.Stories.Include(st => st.Articles).SingleAsync();
+        Assert.Equal(open.Id, story.Id);
+        Assert.Equal("Arsenal thắng derby", story.HeadlineVi);
+        Assert.Single(story.Articles);
+        Assert.True(story.LastUpdatedUtc > lastUpdatedBefore);
+    }
+
+    [Fact]
+    public async Task RunAsync_News_UnknownStoryReference_GetsItsOwnStory()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss(("Arsenal derby", "https://c.com/3")));
+        h.Gemini = _ => TestDbFactory.JsonResponse(GeminiFor(1, storyRef: "S999")); // no such open story
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        var story = await read.Stories.SingleAsync();
+        Assert.Equal(story.Id, (await read.NewsArticles.SingleAsync()).StoryId);
+    }
+
+    [Fact]
+    public async Task RunAsync_News_HidesJunkSources_AndNeverSendsThemToGemini()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.Db.NewsSources.Add(new NewsSource { Pattern = "FanDuel", Tier = 0 });
+        h.Db.NewsSources.Add(new NewsSource { Pattern = "BBC", Tier = 1 });
+        await h.Db.SaveChangesAsync();
+        h.Collector.SportsRssFeeds =
+        [
+            new("FanDuel Sportsbook", "https://fanduel.example/rss", "en"),
+            new("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml", "en")
+        ];
+        h.Rss = req => TestDbFactory.XmlResponse(req.RequestUri!.Host.Contains("fanduel")
+            ? TestDbFactory.Rss(("Arsenal v Chelsea odds and picks", "https://fanduel.example/odds"))
+            : req.RequestUri.Host.Contains("bbci")
+                ? TestDbFactory.Rss(("Arsenal win derby", "https://bbc.co.uk/1"))
+                : TestDbFactory.Rss());
+        var geminiCalls = 0;
+        h.Gemini = req =>
+        {
+            geminiCalls++;
+            Assert.DoesNotContain("odds and picks", req.Content!.ReadAsStringAsync().Result);
+            return TestDbFactory.JsonResponse(GeminiFor(2));
+        };
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        var junk = await read.NewsArticles.SingleAsync(a => a.Url == "https://fanduel.example/odds");
+        Assert.Equal((0, false, true), (junk.SourceTier, junk.IsRelevant, junk.IsNotified));
+        Assert.Equal(1, (await read.NewsArticles.SingleAsync(a => a.Url == "https://bbc.co.uk/1")).SourceTier);
+        Assert.Equal(1, geminiCalls);
+    }
+
+    [Fact]
+    public async Task RunAsync_Telegram_PushesImportantStoriesOnce_UntilTheyAreUpdated()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.TelegramOptions.BotToken = "token";
+        h.TelegramOptions.ChatId = "chat";
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss(
+            ("Arsenal win derby", "https://bbc.com/1"),
+            ("Arsenal training photos", "https://bbc.com/2")));
+        h.Gemini = _ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse("""
+            {"articles":[
+              {"articleId":1,"isRelevant":true,"topic":"Match","claimType":"Official","importance":4,"summaryVi":"a","matchedEntities":["Arsenal"],"storyRef":"N1"},
+              {"articleId":2,"isRelevant":true,"topic":"Other","claimType":"Report","importance":1,"summaryVi":"b","matchedEntities":["Arsenal"],"storyRef":"N2"}],
+             "stories":[
+              {"ref":"N1","headlineVi":"Arsenal thắng derby","summaryVi":"x","topic":"Match","importance":4},
+              {"ref":"N2","headlineVi":"Ảnh tập luyện","summaryVi":"y","topic":"Other","importance":1}]}
+            """));
+
+        await h.Build().RunAsync(CollectorMode.News);
+        Assert.Single(h.TelegramHandler!.Requests);
+
+        await using (var read = h.NewContext())
+        {
+            var stories = await read.Stories.ToListAsync();
+            Assert.NotNull(stories.Single(st => st.HeadlineVi == "Arsenal thắng derby").NotifiedAtUtc);
+            Assert.Null(stories.Single(st => st.HeadlineVi == "Ảnh tập luyện").NotifiedAtUtc); // too minor to push
+        }
+
+        // Nothing new: nothing is pushed again.
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss());
+        await h.Build().RunAsync(CollectorMode.News);
+        Assert.Empty(h.TelegramHandler!.Requests);
     }
 }
