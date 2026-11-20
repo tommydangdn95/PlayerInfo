@@ -103,56 +103,6 @@ public sealed class ControllersTests
     }
 
     [Fact]
-    public async Task NewsController_ByTeam_ReturnsTrackedTeamsWithCountsAndNewestArticles()
-    {
-        await using var db = TestDbFactory.CreateInMemory();
-        var arsenal = new Team { EspnId = "359", Name = "Arsenal", LogoUrl = "https://logo/359.png" };
-        var chelsea = new Team { EspnId = "363", Name = "Chelsea" };
-        var untracked = new Team { EspnId = "1", Name = "Untracked", IsTracked = false };
-        db.Teams.AddRange(arsenal, chelsea, untracked);
-        await db.SaveChangesAsync();
-        var saka = new Player { EspnId = "1001", FullName = "Bukayo Saka", TeamId = arsenal.Id };
-        db.Players.Add(saka);
-
-        var now = DateTime.UtcNow;
-        var articles = Enumerable.Range(1, 5).Select(i => new NewsArticle
-        {
-            UrlHash = $"h{i}", Url = $"https://a/{i}", Title = $"Arsenal {i}", PublishedAtUtc = now.AddHours(-i), IsHot = i == 4
-        }).ToList();
-        var old = new NewsArticle { UrlHash = "old", Url = "https://a/old", Title = "Old", PublishedAtUtc = now.AddDays(-10) };
-        db.NewsArticles.AddRange(articles);
-        db.NewsArticles.Add(old);
-        await db.SaveChangesAsync();
-        foreach (var a in articles.Take(4))
-        {
-            db.ArticleEntities.Add(new ArticleEntity { ArticleId = a.Id, EntityType = "Team", EntityId = arsenal.Id });
-        }
-
-        // Linked through the player AND the team: counted once.
-        db.ArticleEntities.Add(new ArticleEntity { ArticleId = articles[0].Id, EntityType = "Player", EntityId = saka.Id });
-        db.ArticleEntities.Add(new ArticleEntity { ArticleId = articles[4].Id, EntityType = "Player", EntityId = saka.Id });
-        db.ArticleEntities.Add(new ArticleEntity { ArticleId = old.Id, EntityType = "Team", EntityId = chelsea.Id });
-        db.ArticleEntities.Add(new ArticleEntity { ArticleId = articles[1].Id, EntityType = "Team", EntityId = untracked.Id });
-        await db.SaveChangesAsync();
-        var controller = new NewsController(db);
-
-        var result = await controller.GetByTeamAsync(fromUtc: now.AddDays(-3), perTeam: 3);
-        var teams = Assert.IsType<List<NewsController.TeamNewsDto>>(Assert.IsType<OkObjectResult>(result).Value);
-
-        Assert.Equal(["Arsenal", "Chelsea"], teams.Select(t => t.Name));
-        var a1 = teams[0];
-        Assert.Equal((5, 1, "https://logo/359.png"), (a1.Total, a1.HotCount, a1.LogoUrl));
-        Assert.Equal(["Arsenal 1", "Arsenal 2", "Arsenal 3"], a1.Items.Select(i => i.Title));
-        Assert.Equal((0, 0), (teams[1].Total, teams[1].Items.Count)); // its only article is out of range
-
-        var hotOnly = Assert.IsType<List<NewsController.TeamNewsDto>>(Assert.IsType<OkObjectResult>(
-            await controller.GetByTeamAsync(teamId: arsenal.Id, hot: true)).Value);
-        var single = Assert.Single(hotOnly);
-        Assert.Equal("Arsenal 4", Assert.Single(single.Items).Title);
-        Assert.True(single.Items[0].IsHot);
-    }
-
-    [Fact]
     public async Task WatchlistController_CrudAliases_WorksAndReturnsNotFoundForMissingId()
     {
         await using var db = TestDbFactory.CreateInMemory();

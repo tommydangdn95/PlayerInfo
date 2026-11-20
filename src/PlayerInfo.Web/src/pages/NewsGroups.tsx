@@ -1,4 +1,5 @@
-import { categoryLabel, dayHeading, formatDateTime, formatTime, vnDayKey, type NewsItem, type NewsTeam } from '../types';
+import { CLAIM_LABELS, dayHeading, formatDateTime, formatTime, vnDayKey, type NewsItem, type NewsTeam } from '../types';
+import { TierBadge, TopicTag } from './StoryBits';
 
 export const UNTAGGED_TEAM: NewsTeam = { id: 0, name: 'Tin chung (chưa gắn đội)', logoUrl: null };
 
@@ -75,7 +76,8 @@ function NewsRow({ item, mode, hideTeamId }: { item: NewsItem; mode: 'day' | 'te
           {mode === 'day' ? formatTime(item.publishedAtUtc) : formatDateTime(item.publishedAtUtc)}
         </span>
         {item.isHot && <span className="tag tag-hot">🔥 Tin nóng</span>}
-        <span className={`tag tag-${item.category.toLowerCase()}`}>{categoryLabel(item.category)}</span>
+        {item.importance > 0 && <TopicTag topic={item.category} />}
+        {item.claimType && <span className="tag">{CLAIM_LABELS[item.claimType]}</span>}
         {otherTeams.map((team) => (
           <span key={team.id} className="team-chip">
             <TeamLogo team={team} />
@@ -83,6 +85,7 @@ function NewsRow({ item, mode, hideTeamId }: { item: NewsItem; mode: 'day' | 'te
           </span>
         ))}
         {mode === 'day' && item.teams.length === 0 && <span className="team-chip team-chip-none">Chưa gắn đội</span>}
+        <TierBadge tier={item.sourceTier} />
         <span className="muted small">{item.sourceName}</span>
       </div>
       <a href={item.url} target="_blank" rel="noreferrer noopener">

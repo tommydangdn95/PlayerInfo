@@ -17,11 +17,13 @@ public static class DatabaseInitializer
         {
             // InMemory provider (local development without a connection string).
             await db.Database.EnsureCreatedAsync(ct);
+            await Services.SourceTiers.EnsureDefaultsAsync(db, ct);
             return;
         }
 
         await BaselineLegacySchemaAsync(db, logger, ct);
         await db.Database.MigrateAsync(ct);
+        await Services.SourceTiers.EnsureDefaultsAsync(db, ct);
     }
 
     /// <summary>

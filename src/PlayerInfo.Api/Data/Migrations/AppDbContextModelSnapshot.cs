@@ -144,8 +144,15 @@ namespace PlayerInfo.Api.Data.Migrations
                         .HasMaxLength(50)
                         .HasColumnType("character varying(50)");
 
+                    b.Property<string>("ClaimType")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
                     b.Property<DateTime>("FetchedAtUtc")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Importance")
+                        .HasColumnType("integer");
 
                     b.Property<bool>("IsAiProcessed")
                         .HasColumnType("boolean");
@@ -174,6 +181,14 @@ namespace PlayerInfo.Api.Data.Migrations
                         .HasMaxLength(150)
                         .HasColumnType("character varying(150)");
 
+                    b.Property<int>("SourceTier")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(3);
+
+                    b.Property<long?>("StoryId")
+                        .HasColumnType("bigint");
+
                     b.Property<string>("SummaryVi")
                         .HasColumnType("text");
 
@@ -195,10 +210,36 @@ namespace PlayerInfo.Api.Data.Migrations
 
                     b.HasIndex("PublishedAtUtc");
 
+                    b.HasIndex("StoryId");
+
                     b.HasIndex("UrlHash")
                         .IsUnique();
 
                     b.ToTable("NewsArticles");
+                });
+
+            modelBuilder.Entity("PlayerInfo.Api.Data.Entities.NewsSource", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Pattern")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<int>("Tier")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Pattern")
+                        .IsUnique();
+
+                    b.ToTable("NewsSources");
                 });
 
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Player", b =>
@@ -341,6 +382,57 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.ToTable("PlayerTransfers");
                 });
 
+            modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Story", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("BestTier")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Confidence")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<DateTime>("FirstSeenUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("HeadlineVi")
+                        .IsRequired()
+                        .HasMaxLength(300)
+                        .HasColumnType("character varying(300)");
+
+                    b.Property<int>("Importance")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime>("LastUpdatedUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("NotifiedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("SourceCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("SummaryVi")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Topic")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("LastUpdatedUtc");
+
+                    b.ToTable("Stories");
+                });
+
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Team", b =>
                 {
                     b.Property<int>("Id")
@@ -432,6 +524,16 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Navigation("Article");
                 });
 
+            modelBuilder.Entity("PlayerInfo.Api.Data.Entities.NewsArticle", b =>
+                {
+                    b.HasOne("PlayerInfo.Api.Data.Entities.Story", "Story")
+                        .WithMany("Articles")
+                        .HasForeignKey("StoryId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.Navigation("Story");
+                });
+
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Player", b =>
                 {
                     b.HasOne("PlayerInfo.Api.Data.Entities.Team", "Team")
@@ -445,6 +547,11 @@ namespace PlayerInfo.Api.Data.Migrations
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.NewsArticle", b =>
                 {
                     b.Navigation("Entities");
+                });
+
+            modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Story", b =>
+                {
+                    b.Navigation("Articles");
                 });
 
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.Team", b =>

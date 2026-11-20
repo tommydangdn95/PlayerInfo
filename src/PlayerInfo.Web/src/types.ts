@@ -61,21 +61,85 @@ export interface NewsItem {
   sourceName: string;
   url: string;
   publishedAtUtc: string;
-  /** Major/breaking news for a tracked club, as judged by Gemini. */
+  /** Importance 4-5, as judged by Gemini. */
   isHot: boolean;
+  /** 1 (minor) .. 5 (must-know); 0 = not processed by Gemini yet. */
+  importance: number;
+  claimType: ClaimType | null;
+  /** 1 (most reliable) .. 3, 0 = junk. */
+  sourceTier: number;
+  storyId: number | null;
   /** Teams the article is about: linked directly or through a linked player. */
   teams: NewsTeam[];
 }
 
-/** A tracked team with its newest articles (GET /api/news/by-team). */
-export interface TeamNews {
+export type ClaimType = 'Official' | 'Report' | 'Rumour' | 'Opinion';
+export type Confidence = 'Official' | 'Confirmed' | 'Rumour' | 'Opinion';
+
+/** The same news reported by one or more sources, grouped by Gemini. */
+export interface Story {
+  id: number;
+  headlineVi: string;
+  summaryVi: string | null;
+  topic: string;
+  importance: number;
+  isHot: boolean;
+  confidence: Confidence;
+  sourceCount: number;
+  bestTier: number;
+  firstSeenUtc: string;
+  lastUpdatedUtc: string;
+}
+
+/** A tracked team with the day's most important stories (GET /api/stories/by-team). */
+export interface TeamStories {
   id: number;
   name: string;
   logoUrl: string | null;
   leagueSlug: string | null;
-  total: number;
+  storyCount: number;
   hotCount: number;
-  items: NewsItem[];
+  /** Articles of the day not grouped into a story yet (Gemini pending or unavailable). */
+  pendingCount: number;
+  stories: Story[];
+}
+
+export interface ArticleRef {
+  id: number;
+  title: string;
+  sourceName: string;
+  sourceTier: number;
+  claimType: ClaimType | null;
+  url: string;
+  publishedAtUtc: string;
+}
+
+export interface MatchInfo {
+  kickoffUtc: string;
+  league: string;
+  home: string;
+  away: string;
+  homeGoals: number | null;
+  awayGoals: number | null;
+  status: string;
+}
+
+export interface Briefing {
+  team: { id: number; name: string; logoUrl: string | null; leagueSlug: string | null };
+  day: string;
+  lastMatch: MatchInfo | null;
+  nextMatch: MatchInfo | null;
+  injuries: { playerName: string; reason: string; status: string | null; reportedDateUtc: string }[];
+  transfers: { playerName: string; from: string; to: string; type: string | null; dateUtc: string; incoming: boolean }[];
+  stories: { story: Story; articleCount: number; articles: ArticleRef[] }[];
+  pendingCount: number;
+  pendingArticles: ArticleRef[];
+}
+
+export interface NewsSourceRule {
+  id: number;
+  pattern: string;
+  tier: number;
 }
 
 export interface NewsTeam {
@@ -91,16 +155,61 @@ export interface NewsPage {
   items: NewsItem[];
 }
 
-export const NEWS_CATEGORIES: { value: string; label: string }[] = [
-  { value: 'Injury', label: 'Chấn thương' },
-  { value: 'Transfer', label: 'Chuyển nhượng' },
-  { value: 'MatchPerformance', label: 'Trận đấu' },
-  { value: 'OffPitch', label: 'Ngoài sân cỏ' },
-  { value: 'Other', label: 'Khác' },
+/** News topics, as tagged by Gemini (same list as the API's NewsTaxonomy.Topics). */
+export const NEWS_CATEGORIES: { value: string; label: string; emoji: string }[] = [
+  { value: 'Transfer', label: 'Chuyển nhượng', emoji: '🔁' },
+  { value: 'Injury', label: 'Chấn thương & lực lượng', emoji: '🏥' },
+  { value: 'Match', label: 'Trận đấu', emoji: '⚽' },
+  { value: 'PreMatch', label: 'Trước trận', emoji: '📋' },
+  { value: 'Manager', label: 'HLV & ban huấn luyện', emoji: '👔' },
+  { value: 'Turmoil', label: 'Nội bộ & khủng hoảng', emoji: '⚠️' },
+  { value: 'Discipline', label: 'Kỷ luật', emoji: '🟥' },
+  { value: 'Club', label: 'CLB & tài chính', emoji: '💰' },
+  { value: 'Other', label: 'Khác', emoji: '📰' },
 ];
 
+const LEGACY_TOPICS: Record<string, string> = { MatchPerformance: 'Match', OffPitch: 'Other' };
+
+function topicMeta(topic: string) {
+  const value = LEGACY_TOPICS[topic] ?? topic;
+  return NEWS_CATEGORIES.find((c) => c.value === value) ?? NEWS_CATEGORIES[NEWS_CATEGORIES.length - 1];
+}
+
 export function categoryLabel(category: string): string {
-  return NEWS_CATEGORIES.find((c) => c.value === category)?.label ?? category;
+  return topicMeta(category).label;
+}
+
+export function topicEmoji(topic: string): string {
+  return topicMeta(topic).emoji;
+}
+
+export const CONFIDENCE: Record<Confidence, { label: string; emoji: string; className: string }> = {
+  Official: { label: 'Chính thức', emoji: '✅', className: 'conf-official' },
+  Confirmed: { label: 'Nhiều nguồn uy tín', emoji: '🟢', className: 'conf-confirmed' },
+  Rumour: { label: 'Tin đồn', emoji: '🟠', className: 'conf-rumour' },
+  Opinion: { label: 'Bình luận', emoji: '💬', className: 'conf-opinion' },
+};
+
+export function confidenceMeta(confidence: string) {
+  return CONFIDENCE[confidence as Confidence] ?? CONFIDENCE.Rumour;
+}
+
+export const CLAIM_LABELS: Record<ClaimType, string> = {
+  Official: 'Chính thức',
+  Report: 'Đưa tin',
+  Rumour: 'Tin đồn',
+  Opinion: 'Bình luận',
+};
+
+export const TIERS: { value: number; label: string; hint: string }[] = [
+  { value: 1, label: 'Hạng 1', hint: 'Hãng tin, đài lớn, cơ quan chính thức' },
+  { value: 2, label: 'Hạng 2', hint: 'Báo lớn, báo chuyên, báo địa phương uy tín' },
+  { value: 3, label: 'Hạng 3', hint: 'Báo lá cải, trang tổng hợp' },
+  { value: 0, label: 'Rác', hint: 'Cá cược, câu view: ẩn đi' },
+];
+
+export function tierLabel(tier: number): string {
+  return TIERS.find((t) => t.value === tier)?.label ?? `Hạng ${tier}`;
 }
 
 const VN_TZ = 'Asia/Ho_Chi_Minh';

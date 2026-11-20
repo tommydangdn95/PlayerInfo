@@ -10,6 +10,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<WatchlistAlias> WatchlistAliases => Set<WatchlistAlias>();
     public DbSet<NewsArticle> NewsArticles => Set<NewsArticle>();
     public DbSet<ArticleEntity> ArticleEntities => Set<ArticleEntity>();
+    public DbSet<Story> Stories => Set<Story>();
+    public DbSet<NewsSource> NewsSources => Set<NewsSource>();
     public DbSet<PlayerInjury> PlayerInjuries => Set<PlayerInjury>();
     public DbSet<PlayerTransfer> PlayerTransfers => Set<PlayerTransfer>();
     public DbSet<Fixture> Fixtures => Set<Fixture>();
@@ -54,6 +56,26 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             e.Property(x => x.Title).HasMaxLength(500);
             e.Property(x => x.SourceName).HasMaxLength(150);
             e.Property(x => x.Category).HasMaxLength(50);
+            e.Property(x => x.ClaimType).HasMaxLength(20);
+            e.Property(x => x.SourceTier).HasDefaultValue(3);
+            e.HasOne(x => x.Story)
+                .WithMany(s => s.Articles)
+                .HasForeignKey(x => x.StoryId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<Story>(e =>
+        {
+            e.HasIndex(x => x.LastUpdatedUtc);
+            e.Property(x => x.HeadlineVi).HasMaxLength(300);
+            e.Property(x => x.Topic).HasMaxLength(50);
+            e.Property(x => x.Confidence).HasMaxLength(20);
+        });
+
+        modelBuilder.Entity<NewsSource>(e =>
+        {
+            e.HasIndex(x => x.Pattern).IsUnique();
+            e.Property(x => x.Pattern).HasMaxLength(100);
         });
 
         modelBuilder.Entity<ArticleEntity>(e =>

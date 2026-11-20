@@ -1,9 +1,11 @@
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 import { useAuth } from './auth';
+import { BriefingPage } from './pages/BriefingPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { LoginPage } from './pages/LoginPage';
 import { LogsPage } from './pages/LogsPage';
 import { NewsArticlesPage } from './pages/NewsPage';
+import { SourcesPage } from './pages/SourcesPage';
 import { TeamsPage } from './pages/TeamsPage';
 
 function RequireAuth() {
@@ -27,6 +29,7 @@ function Layout() {
           </NavLink>
           <NavLink to="/news">Tin tức</NavLink>
           <NavLink to="/teams">Đội bóng</NavLink>
+          <NavLink to="/sources">Nguồn tin</NavLink>
           <NavLink to="/logs">Nhật ký</NavLink>
         </nav>
         <div className="user">
@@ -50,6 +53,8 @@ export function App() {
       <Route element={<RequireAuth />}>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/news" element={<NewsArticlesPage />} />
+        <Route path="/briefing/:teamId" element={<BriefingPage />} />
+        <Route path="/sources" element={<SourcesPage />} />
         <Route path="/teams" element={<TeamsPage />} />
         <Route path="/logs" element={<LogsPage />} />
       </Route>

@@ -50,10 +50,10 @@ public static class TestDbFactory
             Content = new StringContent(xml, System.Text.Encoding.UTF8, "application/xml")
         };
 
-    public static string GeminiResponse(string innerJsonArray)
+    public static string GeminiResponse(string innerJson)
         => System.Text.Json.JsonSerializer.Serialize(new
         {
-            candidates = new[] { new { content = new { parts = new[] { new { text = innerJsonArray } } } } }
+            candidates = new[] { new { content = new { parts = new[] { new { text = innerJson } } } } }
         });
 
     public static string Rss(params (string Title, string Link)[] items)
@@ -80,7 +80,7 @@ public sealed class PipelineHarness : IAsyncDisposable
     public AppDbContext Db { get; }
 
     public Func<HttpRequestMessage, HttpResponseMessage> Rss { get; set; } = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss());
-    public Func<HttpRequestMessage, HttpResponseMessage> Gemini { get; set; } = _ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse("[]"));
+    public Func<HttpRequestMessage, HttpResponseMessage> Gemini { get; set; } = _ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse("""{"articles":[],"stories":[]}"""));
     public Func<HttpRequestMessage, HttpResponseMessage> Telegram { get; set; } = _ => TestDbFactory.JsonResponse("{\"ok\":true}");
     public Func<HttpRequestMessage, HttpResponseMessage> ApiFootball { get; set; } = _ => TestDbFactory.JsonResponse("{\"response\":[]}");
     public Func<HttpRequestMessage, HttpResponseMessage> Espn { get; set; } = _ => TestDbFactory.JsonResponse("{}");

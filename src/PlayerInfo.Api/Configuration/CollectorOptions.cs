@@ -70,6 +70,21 @@ public sealed class CollectorOptions
     public List<RssFeedSource> SportsRssFeeds { get; set; } = [];
 
     public string GeminiModel { get; set; } = "gemini-3.8-flash";
+
+    /// <summary>
+    /// Tried in order when the main model is overloaded (503), rate limited (429), retired (404) or times out.
+    /// Same binding caveat as <see cref="Leagues"/>.
+    /// </summary>
+    public List<string> GeminiFallbackModels { get; set; } = [];
+
+    public static readonly IReadOnlyList<string> DefaultGeminiFallbackModels = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+
+    /// <summary>The main model, then the fallbacks, without duplicates.</summary>
+    public IEnumerable<string> GeminiModels()
+        => new[] { GeminiModel }.Concat(GeminiFallbackModels)
+            .Where(m => !string.IsNullOrWhiteSpace(m))
+            .Select(m => m.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase);
     public int GeminiBatchSize { get; set; } = 15;
 
     /// <summary>
@@ -91,6 +106,11 @@ public sealed class CollectorOptions
                 .Where(f => !string.IsNullOrWhiteSpace(f.Url))
                 .DistinctBy(f => f.Url, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+        if (GeminiFallbackModels.Count == 0)
+        {
+            GeminiFallbackModels = [.. DefaultGeminiFallbackModels];
+        }
 
         GeminiBatchSize = Math.Max(1, GeminiBatchSize);
     }
