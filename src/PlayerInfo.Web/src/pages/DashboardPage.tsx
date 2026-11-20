@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, errorMessage } from '../api';
-import { formatDateTime, type JobMode, type NewsPage, type Quota } from '../types';
+import { type JobMode, type Quota } from '../types';
+import { TeamNewsBoard } from './TeamNewsBoard';
 
 const JOBS: { mode: JobMode; label: string; hint: string }[] = [
   { mode: 'news', label: 'Tin tức', hint: 'Tin ESPN, Google News, RSS + Gemini + Telegram. Không tốn quota API-Football.' },
@@ -12,7 +13,7 @@ const JOBS: { mode: JobMode; label: string; hint: string }[] = [
 
 export function DashboardPage() {
   const [quota, setQuota] = useState<Quota | null>(null);
-  const [news, setNews] = useState<NewsPage | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<JobMode | null>(null);
   const [jobMessage, setJobMessage] = useState<string | null>(null);
@@ -21,12 +22,7 @@ export function DashboardPage() {
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [q, n] = await Promise.all([
-        api<Quota>('/api/jobs/quota'),
-        api<NewsPage>('/api/news?page=1&pageSize=15'),
-      ]);
-      setQuota(q);
-      setNews(n);
+      setQuota(await api<Quota>('/api/jobs/quota'));
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -53,7 +49,13 @@ export function DashboardPage() {
     <div className="stack">
       <div className="page-head">
         <h2>Tổng quan</h2>
-        <button className="btn btn-ghost" onClick={() => void load()}>
+        <button
+          className="btn btn-ghost"
+          onClick={() => {
+            void load();
+            setRefreshKey((k) => k + 1);
+          }}
+        >
           Làm mới
         </button>
       </div>
@@ -108,29 +110,7 @@ export function DashboardPage() {
         </div>
       </section>
 
-      <section className="card">
-        <h3>Tin mới nhất</h3>
-        {!news && <p className="muted">Đang tải…</p>}
-        {news && news.items.length === 0 && (
-          <p className="muted">Chưa có tin. Thêm đội ở mục "Đội bóng" rồi chạy job "Tin tức".</p>
-        )}
-        <ul className="news-list">
-          {news?.items.map((item) => (
-            <li key={item.id}>
-              <div className="news-meta">
-                <span className={`tag tag-${item.category.toLowerCase()}`}>{item.category}</span>
-                <span className="muted small">
-                  {item.sourceName} · {formatDateTime(item.publishedAtUtc)}
-                </span>
-              </div>
-              <a href={item.url} target="_blank" rel="noreferrer noopener">
-                {item.title}
-              </a>
-              {item.summaryVi && <p className="summary">{item.summaryVi}</p>}
-            </li>
-          ))}
-        </ul>
-      </section>
+      <TeamNewsBoard refreshKey={refreshKey} />
     </div>
   );
 }

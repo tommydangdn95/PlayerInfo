@@ -12,7 +12,8 @@ public sealed record GeminiArticleResult(
     [property: JsonPropertyName("isRelevant")] bool IsRelevant,
     [property: JsonPropertyName("category")] string? Category,
     [property: JsonPropertyName("summaryVi")] string? SummaryVi,
-    [property: JsonPropertyName("matchedEntities")] List<string>? MatchedEntities);
+    [property: JsonPropertyName("matchedEntities")] List<string>? MatchedEntities,
+    [property: JsonPropertyName("isHot")] bool IsHot = false);
 
 /// <summary>
 /// Outcome of one Gemini batch. <see cref="Succeeded"/> is false when the call failed
@@ -54,9 +55,10 @@ public sealed class GeminiEnricherClient(
                 ["isRelevant"] = new { type = "BOOLEAN" },
                 ["category"] = new { type = "STRING", @enum = Categories },
                 ["summaryVi"] = new { type = "STRING" },
-                ["matchedEntities"] = new { type = "ARRAY", items = new { type = "STRING" } }
+                ["matchedEntities"] = new { type = "ARRAY", items = new { type = "STRING" } },
+                ["isHot"] = new { type = "BOOLEAN" }
             },
-            required = new[] { "articleId", "isRelevant", "category", "summaryVi", "matchedEntities" }
+            required = new[] { "articleId", "isRelevant", "category", "summaryVi", "matchedEntities", "isHot" }
         }
     };
 
@@ -141,6 +143,11 @@ public sealed class GeminiEnricherClient(
         sb.AppendLine($"- category (one of: {string.Join(", ", Categories)})");
         sb.AppendLine("- summaryVi (concise 1-2 sentence summary in Vietnamese)");
         sb.AppendLine("- matchedEntities (array of tracked team/player names from the list below that the article is about, using the exact spelling from the list)");
+        sb.AppendLine("- isHot (boolean: true ONLY for important, newsworthy news about a tracked team/player that a fan must not miss:");
+        sb.AppendLine("  a confirmed or advanced transfer, a significant injury or return of a key player, a manager sacked/appointed,");
+        sb.AppendLine("  a final match result or major upset, a suspension/disciplinary decision, an official club announcement.");
+        sb.AppendLine("  false for previews, predictions, opinion, gossip round-ups, betting tips, fan reactions, minor or old news.");
+        sb.AppendLine("  At most about 1 in 5 articles should be hot.)");
         sb.AppendLine();
         sb.AppendLine($"Tracked entities: {string.Join(", ", trackedEntities)}");
         sb.AppendLine();

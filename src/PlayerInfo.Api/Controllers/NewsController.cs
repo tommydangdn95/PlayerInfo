@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using PlayerInfo.Api.Data;
+using PlayerInfo.Api.Data.Entities;
 
 namespace PlayerInfo.Api.Controllers;
 
@@ -8,42 +9,132 @@ namespace PlayerInfo.Api.Controllers;
 [Route("api/[controller]")]
 public sealed class NewsController(AppDbContext db) : ControllerBase
 {
+    public sealed record ArticleTeamDto(int Id, string Name, string? LogoUrl);
+
+    public sealed record ArticleDto(
+        long Id,
+        string Title,
+        string? SummaryVi,
+        string Category,
+        string SourceName,
+        string Url,
+        DateTime PublishedAtUtc,
+        bool IsHot,
+        IReadOnlyList<ArticleTeamDto> Teams);
+
+    public sealed record TeamNewsDto(
+        int Id,
+        string Name,
+        string? LogoUrl,
+        string? LeagueSlug,
+        int Total,
+        int HotCount,
+        IReadOnlyList<ArticleDto> Items);
+
+    /// <summary>
+    /// Relevant articles, newest first. Each article carries the teams it is about: teams linked directly,
+    /// plus the teams of linked players. Filters: category, team (directly or through its players),
+    /// a published-at range [fromUtc, toUtc) and hot (Gemini-flagged major news) only.
+    /// </summary>
     [HttpGet]
     public async Task<IActionResult> GetArticlesAsync(
         [FromQuery] string? category = null,
+        [FromQuery] int? teamId = null,
+        [FromQuery] DateTime? fromUtc = null,
+        [FromQuery] DateTime? toUtc = null,
+        [FromQuery] bool hot = false,
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20,
         CancellationToken ct = default)
     {
         page = Math.Max(1, page);
-        pageSize = Math.Clamp(pageSize, 1, 100);
+        pageSize = Math.Clamp(pageSize, 1, 200);
 
-        var query = db.NewsArticles
-            .AsNoTracking()
-            .Where(x => x.IsRelevant);
-
-        if (!string.IsNullOrWhiteSpace(category))
+        var query = Filter(category, fromUtc, toUtc, hot);
+        if (teamId is { } tid)
         {
-            query = query.Where(x => x.Category == category);
+            var playerIds = db.Players.Where(p => p.TeamId == tid).Select(p => p.Id);
+            query = query.Where(x => x.Entities.Any(e =>
+                (e.EntityType == "Team" && e.EntityId == tid) ||
+                (e.EntityType == "Player" && playerIds.Contains(e.EntityId))));
         }
 
-        var items = await query
+        var total = await query.CountAsync(ct);
+        var ids = await query
             .OrderByDescending(x => x.PublishedAtUtc)
+            .ThenByDescending(x => x.Id)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(x => new
-            {
-                x.Id,
-                x.Title,
-                x.SummaryVi,
-                x.Category,
-                x.SourceName,
-                x.Url,
-                x.PublishedAtUtc
-            })
+            .Select(x => x.Id)
             .ToListAsync(ct);
 
-        return Ok(new { page, pageSize, items });
+        var items = await LoadArticlesAsync(ids, ct);
+        return Ok(new { page, pageSize, total, items });
+    }
+
+    /// <summary>
+    /// One entry per tracked team (or only <paramref name="teamId"/>), with its logo, how many articles
+    /// match the filters, how many of them are hot, and the newest <paramref name="perTeam"/> of them.
+    /// </summary>
+    [HttpGet("by-team")]
+    public async Task<IActionResult> GetByTeamAsync(
+        [FromQuery] int? teamId = null,
+        [FromQuery] DateTime? fromUtc = null,
+        [FromQuery] DateTime? toUtc = null,
+        [FromQuery] bool hot = false,
+        [FromQuery] int perTeam = 3,
+        CancellationToken ct = default)
+    {
+        perTeam = Math.Clamp(perTeam, 1, 20);
+
+        var teams = await db.Teams.AsNoTracking()
+            .Where(t => t.IsTracked && (teamId == null || t.Id == teamId))
+            .OrderBy(t => t.Name)
+            .ToListAsync(ct);
+        var teamIds = teams.Select(t => t.Id).ToList();
+
+        var playerTeam = await db.Players.AsNoTracking()
+            .Where(p => p.TeamId != null && teamIds.Contains(p.TeamId.Value))
+            .ToDictionaryAsync(p => p.Id, p => p.TeamId!.Value, ct);
+        var playerIds = playerTeam.Keys.ToList();
+
+        // Every (article, team) pair in range, then grouped in memory: a handful of queries in total
+        // instead of several per team.
+        var links = await Filter(null, fromUtc, toUtc, hot)
+            .SelectMany(a => a.Entities, (a, e) => new { a.Id, a.PublishedAtUtc, a.IsHot, e.EntityType, e.EntityId })
+            .Where(x => (x.EntityType == "Team" && teamIds.Contains(x.EntityId)) ||
+                        (x.EntityType == "Player" && playerIds.Contains(x.EntityId)))
+            .ToListAsync(ct);
+
+        var byTeam = links
+            .Select(l => new
+            {
+                l.Id,
+                l.PublishedAtUtc,
+                l.IsHot,
+                TeamId = l.EntityType == "Team" ? l.EntityId : playerTeam[l.EntityId]
+            })
+            .DistinctBy(l => (l.Id, l.TeamId))
+            .GroupBy(l => l.TeamId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(l => l.PublishedAtUtc).ThenByDescending(l => l.Id).ToList());
+
+        var topIds = byTeam.Values.SelectMany(list => list.Take(perTeam).Select(l => l.Id)).Distinct().ToList();
+        var articles = (await LoadArticlesAsync(topIds, ct)).ToDictionary(a => a.Id);
+
+        var result = teams.Select(t =>
+        {
+            var list = byTeam.GetValueOrDefault(t.Id) ?? [];
+            return new TeamNewsDto(
+                t.Id,
+                t.Name,
+                t.LogoUrl,
+                t.LeagueSlug,
+                list.Count,
+                list.Count(l => l.IsHot),
+                list.Take(perTeam).Select(l => articles[l.Id]).ToList());
+        }).ToList();
+
+        return Ok(result);
     }
 
     [HttpGet("injuries")]
@@ -71,4 +162,99 @@ public sealed class NewsController(AppDbContext db) : ControllerBase
 
         return Ok(items);
     }
+
+    private IQueryable<NewsArticle> Filter(string? category, DateTime? fromUtc, DateTime? toUtc, bool hot)
+    {
+        var query = db.NewsArticles.AsNoTracking().Where(x => x.IsRelevant);
+
+        if (!string.IsNullOrWhiteSpace(category))
+        {
+            query = query.Where(x => x.Category == category);
+        }
+
+        if (fromUtc is { } from)
+        {
+            var f = AsUtc(from);
+            query = query.Where(x => x.PublishedAtUtc >= f);
+        }
+
+        if (toUtc is { } to)
+        {
+            var t = AsUtc(to);
+            query = query.Where(x => x.PublishedAtUtc < t);
+        }
+
+        if (hot)
+        {
+            query = query.Where(x => x.IsHot);
+        }
+
+        return query;
+    }
+
+    /// <summary>The given articles as DTOs with their teams, newest first.</summary>
+    private async Task<List<ArticleDto>> LoadArticlesAsync(List<long> ids, CancellationToken ct)
+    {
+        if (ids.Count == 0)
+        {
+            return [];
+        }
+
+        var rows = await db.NewsArticles.AsNoTracking()
+            .Where(x => ids.Contains(x.Id))
+            .Select(x => new { x.Id, x.Title, x.SummaryVi, x.Category, x.SourceName, x.Url, x.PublishedAtUtc, x.IsHot })
+            .ToListAsync(ct);
+
+        var teamsByArticle = await LoadArticleTeamsAsync(ids, ct);
+        return rows
+            .OrderByDescending(r => r.PublishedAtUtc)
+            .ThenByDescending(r => r.Id)
+            .Select(r => new ArticleDto(r.Id, r.Title, r.SummaryVi, r.Category, r.SourceName, r.Url, r.PublishedAtUtc, r.IsHot,
+                teamsByArticle.TryGetValue(r.Id, out var teams) ? teams : []))
+            .ToList();
+    }
+
+    private async Task<Dictionary<long, IReadOnlyList<ArticleTeamDto>>> LoadArticleTeamsAsync(List<long> articleIds, CancellationToken ct)
+    {
+        var links = await db.ArticleEntities
+            .AsNoTracking()
+            .Where(e => articleIds.Contains(e.ArticleId))
+            .Select(e => new { e.ArticleId, e.EntityType, e.EntityId })
+            .ToListAsync(ct);
+
+        var linkedPlayerIds = links.Where(l => l.EntityType == "Player").Select(l => l.EntityId).Distinct().ToList();
+        var playerTeams = linkedPlayerIds.Count == 0
+            ? new Dictionary<int, int>()
+            : await db.Players.AsNoTracking()
+                .Where(p => linkedPlayerIds.Contains(p.Id) && p.TeamId != null)
+                .ToDictionaryAsync(p => p.Id, p => p.TeamId!.Value, ct);
+
+        var pairs = links
+            .Select(l => (l.ArticleId, TeamId: l.EntityType == "Team"
+                ? l.EntityId
+                : playerTeams.TryGetValue(l.EntityId, out var t) ? t : (int?)null))
+            .Where(p => p.TeamId != null)
+            .Select(p => (p.ArticleId, TeamId: p.TeamId!.Value))
+            .Distinct()
+            .ToList();
+
+        var teamIds = pairs.Select(p => p.TeamId).Distinct().ToList();
+        var teams = await db.Teams.AsNoTracking()
+            .Where(t => teamIds.Contains(t.Id))
+            .ToDictionaryAsync(t => t.Id, t => new ArticleTeamDto(t.Id, t.Name, t.LogoUrl), ct);
+
+        return pairs
+            .Where(p => teams.ContainsKey(p.TeamId))
+            .GroupBy(p => p.ArticleId)
+            .ToDictionary(
+                g => g.Key,
+                g => (IReadOnlyList<ArticleTeamDto>)g.Select(p => teams[p.TeamId]).OrderBy(t => t.Name).ToList());
+    }
+
+    private static DateTime AsUtc(DateTime value) => value.Kind switch
+    {
+        DateTimeKind.Utc => value,
+        DateTimeKind.Local => value.ToUniversalTime(),
+        _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+    };
 }

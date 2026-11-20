@@ -61,12 +61,82 @@ export interface NewsItem {
   sourceName: string;
   url: string;
   publishedAtUtc: string;
+  /** Major/breaking news for a tracked club, as judged by Gemini. */
+  isHot: boolean;
+  /** Teams the article is about: linked directly or through a linked player. */
+  teams: NewsTeam[];
+}
+
+/** A tracked team with its newest articles (GET /api/news/by-team). */
+export interface TeamNews {
+  id: number;
+  name: string;
+  logoUrl: string | null;
+  leagueSlug: string | null;
+  total: number;
+  hotCount: number;
+  items: NewsItem[];
+}
+
+export interface NewsTeam {
+  id: number;
+  name: string;
+  logoUrl: string | null;
 }
 
 export interface NewsPage {
   page: number;
   pageSize: number;
+  total: number;
   items: NewsItem[];
+}
+
+export const NEWS_CATEGORIES: { value: string; label: string }[] = [
+  { value: 'Injury', label: 'Chấn thương' },
+  { value: 'Transfer', label: 'Chuyển nhượng' },
+  { value: 'MatchPerformance', label: 'Trận đấu' },
+  { value: 'OffPitch', label: 'Ngoài sân cỏ' },
+  { value: 'Other', label: 'Khác' },
+];
+
+export function categoryLabel(category: string): string {
+  return NEWS_CATEGORIES.find((c) => c.value === category)?.label ?? category;
+}
+
+const VN_TZ = 'Asia/Ho_Chi_Minh';
+
+/** Calendar day of an instant in Vietnam time, as yyyy-MM-dd. */
+export function vnDayKey(utc: string | Date): string {
+  return new Date(utc).toLocaleDateString('en-CA', { timeZone: VN_TZ });
+}
+
+/** UTC instant of 00:00 Vietnam time (UTC+7, no DST) on the given yyyy-MM-dd day. */
+export function vnDayStartUtc(dayKey: string): Date {
+  return new Date(`${dayKey}T00:00:00+07:00`);
+}
+
+export function addDays(dayKey: string, days: number): string {
+  const d = vnDayStartUtc(dayKey);
+  d.setUTCDate(d.getUTCDate() + days);
+  return vnDayKey(d);
+}
+
+/** "Hôm nay · Thứ Năm, 20/11/2026" style heading for a yyyy-MM-dd day. */
+export function dayHeading(dayKey: string): string {
+  const today = vnDayKey(new Date());
+  const prefix = dayKey === today ? 'Hôm nay · ' : dayKey === addDays(today, -1) ? 'Hôm qua · ' : '';
+  const label = vnDayStartUtc(dayKey).toLocaleDateString('vi-VN', {
+    timeZone: VN_TZ,
+    weekday: 'long',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  });
+  return prefix + label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+export function formatTime(utc: string): string {
+  return new Date(utc).toLocaleTimeString('vi-VN', { timeZone: VN_TZ, hour: '2-digit', minute: '2-digit' });
 }
 
 export type JobMode = 'news' | 'transfers_news' | 'full' | 'roster';

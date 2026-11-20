@@ -170,6 +170,21 @@ public sealed class ClientsTests
     }
 
     [Fact]
+    public void TelegramNotifier_BuildMessage_MarksHotNews()
+    {
+        var articles = new List<NewsArticle>
+        {
+            new() { Id = 1, Title = "Big news", Url = "https://a/1", SourceName = "BBC", Category = "Transfer", IsHot = true },
+            new() { Id = 2, Title = "Small news", Url = "https://a/2", SourceName = "BBC", Category = "Other" }
+        };
+
+        var (text, _) = TelegramNotifier.BuildMessage(articles, "News", DateTime.UtcNow);
+
+        Assert.Contains("🔥 <b>[Transfer]</b> Big news", text);
+        Assert.Contains("• <b>[Other]</b> Small news", text);
+    }
+
+    [Fact]
     public void TelegramNotifier_BuildMessage_EscapesHtmlAndStaysUnderLimit()
     {
         var articles = Enumerable.Range(1, 40).Select(i => new NewsArticle

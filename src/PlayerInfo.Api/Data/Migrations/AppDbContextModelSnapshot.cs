@@ -150,6 +150,9 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.Property<bool>("IsAiProcessed")
                         .HasColumnType("boolean");
 
+                    b.Property<bool>("IsHot")
+                        .HasColumnType("boolean");
+
                     b.Property<bool>("IsNotified")
                         .HasColumnType("boolean");
 

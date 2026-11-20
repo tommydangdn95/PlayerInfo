@@ -69,7 +69,7 @@ public sealed class CollectorOptions
     /// </summary>
     public List<RssFeedSource> SportsRssFeeds { get; set; } = [];
 
-    public string GeminiModel { get; set; } = "gemini-2.5-flash";
+    public string GeminiModel { get; set; } = "gemini-3.8-flash";
     public int GeminiBatchSize { get; set; } = 15;
 
     /// <summary>

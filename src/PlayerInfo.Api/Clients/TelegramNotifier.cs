@@ -79,7 +79,7 @@ public sealed class TelegramNotifier(
         {
             var summary = string.IsNullOrWhiteSpace(a.SummaryVi) ? a.Title : a.SummaryVi;
             var entry =
-                $"• <b>[{WebUtility.HtmlEncode(a.Category)}]</b> {WebUtility.HtmlEncode(summary)}\n" +
+                $"{(a.IsHot ? "🔥" : "•")} <b>[{WebUtility.HtmlEncode(a.Category)}]</b> {WebUtility.HtmlEncode(summary)}\n" +
                 $"  <a href=\"{WebUtility.HtmlEncode(a.Url)}\">{WebUtility.HtmlEncode(a.SourceName)}</a>\n";
 
             if (sb.Length + entry.Length > MaxMessageLength)

@@ -3,6 +3,7 @@ import { useAuth } from './auth';
 import { DashboardPage } from './pages/DashboardPage';
 import { LoginPage } from './pages/LoginPage';
 import { LogsPage } from './pages/LogsPage';
+import { NewsArticlesPage } from './pages/NewsPage';
 import { TeamsPage } from './pages/TeamsPage';
 
 function RequireAuth() {
@@ -24,6 +25,7 @@ function Layout() {
           <NavLink to="/" end>
             Tổng quan
           </NavLink>
+          <NavLink to="/news">Tin tức</NavLink>
           <NavLink to="/teams">Đội bóng</NavLink>
           <NavLink to="/logs">Nhật ký</NavLink>
         </nav>
@@ -47,6 +49,7 @@ export function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route element={<RequireAuth />}>
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/news" element={<NewsArticlesPage />} />
         <Route path="/teams" element={<TeamsPage />} />
         <Route path="/logs" element={<LogsPage />} />
       </Route>

@@ -18,9 +18,9 @@ public sealed class CollectorPipelineTests
         return team;
     }
 
-    private static string GeminiFor(long articleId, string matched = "\"Arsenal\"", bool relevant = true)
+    private static string GeminiFor(long articleId, string matched = "\"Arsenal\"", bool relevant = true, bool hot = false)
         => TestDbFactory.GeminiResponse(
-            $$"""[{"articleId":{{articleId}},"isRelevant":{{(relevant ? "true" : "false")}},"category":"matchperformance","summaryVi":"Arsenal thắng trận derby.","matchedEntities":[{{matched}}]}]""");
+            $$"""[{"articleId":{{articleId}},"isRelevant":{{(relevant ? "true" : "false")}},"category":"matchperformance","summaryVi":"Arsenal thắng trận derby.","matchedEntities":[{{matched}}],"isHot":{{(hot ? "true" : "false")}}}]""");
 
     [Fact]
     public async Task RunAsync_NewsMode_DeduplicatesUrlsAndLinksMatchedTeams()
@@ -56,6 +56,29 @@ public sealed class CollectorPipelineTests
         Assert.Equal("MatchPerformance", newArticle.Category); // normalized casing
         Assert.Equal("Arsenal thắng trận derby.", newArticle.SummaryVi);
         Assert.Equal(team.Id, Assert.Single(newArticle.Entities).EntityId);
+        Assert.False(newArticle.IsHot);
+    }
+
+    [Fact]
+    public async Task RunAsync_News_StoresGeminiHotFlag_OnlyForRelevantArticles()
+    {
+        await using var h = new PipelineHarness();
+        await SeedArsenalAsync(h);
+        h.Rss = _ => TestDbFactory.XmlResponse(TestDbFactory.Rss(("Arsenal sack manager", "https://bbc.com/arsenal-sack")));
+        h.Gemini = _ => TestDbFactory.JsonResponse(GeminiFor(1, hot: true));
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        Assert.True((await read.NewsArticles.SingleAsync()).IsHot);
+
+        await using var h2 = new PipelineHarness();
+        await SeedArsenalAsync(h2);
+        h2.Rss = h.Rss;
+        h2.Gemini = _ => TestDbFactory.JsonResponse(GeminiFor(1, relevant: false, hot: true));
+        await h2.Build().RunAsync(CollectorMode.News);
+        await using var read2 = h2.NewContext();
+        Assert.False((await read2.NewsArticles.SingleAsync()).IsHot); // spam is never hot
     }
 
     [Fact]
@@ -319,5 +342,40 @@ public sealed class CollectorPipelineTests
         Assert.Equal(("ESPN", "Arsenal win again"), (article.SourceName, article.Title));
         var newsCall = Assert.Single(h.EspnHandler!.Requests, r => r.RequestUri!.AbsolutePath.EndsWith("/news"));
         Assert.Contains("team=359", newsCall.RequestUri!.Query);
+
+        // Fetched for Arsenal: tagged with the team even though Gemini is off.
+        var link = await read.ArticleEntities.SingleAsync();
+        Assert.Equal(("Team", article.Id), (link.EntityType, link.ArticleId));
+    }
+
+    [Fact]
+    public async Task RunAsync_News_TagsTeamsByKeyword_WithoutGemini_AndBackfillsOlderArticles()
+    {
+        await using var h = new PipelineHarness();
+        var arsenal = await SeedArsenalAsync(h);
+        var chelsea = new Team { EspnId = "363", LeagueSlug = "eng.1", Name = "Chelsea", IsTracked = true };
+        h.Db.Teams.Add(chelsea);
+        await h.Db.SaveChangesAsync();
+        h.Db.WatchlistAliases.Add(new WatchlistAlias { EntityType = "Team", EntityId = chelsea.Id, Keyword = "Chelsea", Language = "en" });
+        h.Db.NewsArticles.Add(new NewsArticle
+        {
+            UrlHash = "old", Url = "https://x.com/old", Title = "Chelsea sign a striker",
+            PublishedAtUtc = DateTime.UtcNow.AddDays(-2), IsAiProcessed = true, IsNotified = true
+        });
+        await h.Db.SaveChangesAsync();
+        h.ApiKeys.Gemini = string.Empty;
+        h.Collector.SportsRssFeeds = [new("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml", "en")];
+        h.Rss = r => r.RequestUri!.Host.Contains("bbci")
+            ? TestDbFactory.XmlResponse(TestDbFactory.Rss(
+                ("Arsenal and Chelsea meet on Sunday", "https://bbc.com/preview"),
+                ("Chelseanomics: not a team", "https://bbc.com/other-chelsea")))
+            : TestDbFactory.XmlResponse(TestDbFactory.Rss());
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        var articles = await read.NewsArticles.Include(a => a.Entities).ToListAsync();
+        Assert.Equal([arsenal.Id, chelsea.Id], articles.Single(a => a.Url == "https://bbc.com/preview").Entities.Select(e => e.EntityId).Order());
+        Assert.Equal(chelsea.Id, Assert.Single(articles.Single(a => a.Url == "https://x.com/old").Entities).EntityId);
     }
 }
