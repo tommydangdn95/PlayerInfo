@@ -38,6 +38,9 @@ public static class TestDbFactory
     public static QuotaManager CreateQuotaManager(string databaseName)
         => new(new InMemoryDbContextFactory(databaseName), NullLogger<QuotaManager>.Instance);
 
+    public static ApiUsageRecorder CreateApiUsage(string databaseName)
+        => new(new InMemoryDbContextFactory(databaseName), NullLogger<ApiUsageRecorder>.Instance);
+
     public static HttpResponseMessage JsonResponse(string json, HttpStatusCode status = HttpStatusCode.OK)
         => new(status)
         {
@@ -111,7 +114,7 @@ public sealed class PipelineHarness : IAsyncDisposable
             quota, keys, collector, NullLogger<NewsDataClient>.Instance);
         var gemini = new GeminiEnricherClient(
             new HttpClient(new StubHttpMessageHandler(Gemini)) { BaseAddress = new Uri("https://generativelanguage.googleapis.com/") },
-            keys, collector, NullLogger<GeminiEnricherClient>.Instance);
+            keys, collector, TestDbFactory.CreateApiUsage(_dbName), NullLogger<GeminiEnricherClient>.Instance);
         TelegramHandler = new StubHttpMessageHandler(Telegram);
         var telegram = new TelegramNotifier(new HttpClient(TelegramHandler), Options.Create(TelegramOptions), NullLogger<TelegramNotifier>.Instance);
 

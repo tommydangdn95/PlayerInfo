@@ -12,6 +12,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<ArticleEntity> ArticleEntities => Set<ArticleEntity>();
     public DbSet<Story> Stories => Set<Story>();
     public DbSet<NewsSource> NewsSources => Set<NewsSource>();
+    public DbSet<ApiCall> ApiCalls => Set<ApiCall>();
     public DbSet<PlayerInjury> PlayerInjuries => Set<PlayerInjury>();
     public DbSet<PlayerTransfer> PlayerTransfers => Set<PlayerTransfer>();
     public DbSet<Fixture> Fixtures => Set<Fixture>();
@@ -70,6 +71,17 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             e.Property(x => x.HeadlineVi).HasMaxLength(300);
             e.Property(x => x.Topic).HasMaxLength(50);
             e.Property(x => x.Confidence).HasMaxLength(20);
+        });
+
+        modelBuilder.Entity<ApiCall>(e =>
+        {
+            e.HasIndex(x => x.AtUtc);
+            e.HasIndex(x => new { x.Provider, x.Model, x.AtUtc });
+            e.Property(x => x.Provider).HasMaxLength(30);
+            e.Property(x => x.Model).HasMaxLength(80);
+            e.Property(x => x.Endpoint).HasMaxLength(300);
+            e.Property(x => x.Outcome).HasMaxLength(20);
+            e.Property(x => x.JobId).HasMaxLength(20);
         });
 
         modelBuilder.Entity<NewsSource>(e =>

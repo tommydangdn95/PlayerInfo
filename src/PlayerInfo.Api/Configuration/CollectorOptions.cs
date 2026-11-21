@@ -69,15 +69,50 @@ public sealed class CollectorOptions
     /// </summary>
     public List<RssFeedSource> SportsRssFeeds { get; set; } = [];
 
-    public string GeminiModel { get; set; } = "gemini-3.8-flash";
+    /// <summary>
+    /// Main model: the best one available on the free tier, Gemini 4 Hydrogen (20 requests/day, 5/minute).
+    /// When it is out of quota or overloaded, the fallbacks take over: the Flash models, then the Flash Lite
+    /// models that carry the volume (500/day each), then older models as a last resort.
+    /// </summary>
+    public string GeminiModel { get; set; } = "gemini-4-hydrogen";
 
     /// <summary>
-    /// Tried in order when the main model is overloaded (503), rate limited (429), retired (404) or times out.
-    /// Same binding caveat as <see cref="Leagues"/>.
+    /// Tried in order when a model is overloaded (503), retired (404), rate limited (429), times out, or has used
+    /// its daily/minute limit. Same binding caveat as <see cref="Leagues"/>.
     /// </summary>
     public List<string> GeminiFallbackModels { get; set; } = [];
 
-    public static readonly IReadOnlyList<string> DefaultGeminiFallbackModels = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+    public static readonly IReadOnlyList<string> DefaultGeminiFallbackModels =
+    [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite"
+    ];
+
+    /// <summary>
+    /// Free-tier limits per model (Google AI Studio, "Rate limits by model"). Failed requests count too.
+    /// Same binding caveat as <see cref="Leagues"/>.
+    /// </summary>
+    public List<GeminiModelLimit> GeminiModelLimits { get; set; } = [];
+
+    public static readonly IReadOnlyList<GeminiModelLimit> DefaultGeminiModelLimits =
+    [
+        new("gemini-4-hydrogen", 20, 5, 250_000),
+        new("gemini-3.8-flash", 20, 5, 250_000),
+        new("gemini-3.6-flash", 20, 5, 250_000),
+        new("gemini-3.5-flash-lite", 500, 15, 250_000),
+        new("gemini-3.1-flash-lite", 500, 15, 250_000),
+        new("gemini-3-flash-preview", 20, 5, 250_000),
+        new("gemini-2.5-flash", 20, 5, 250_000),
+        new("gemini-2.5-flash-lite", 20, 10, 250_000)
+    ];
+
+    /// <summary>Requests per day for a model not listed in <see cref="GeminiModelLimits"/>; 0 = no limit.</summary>
+    public int GeminiDailyRequestLimit { get; set; } = 20;
 
     /// <summary>The main model, then the fallbacks, without duplicates.</summary>
     public IEnumerable<string> GeminiModels()
@@ -85,7 +120,14 @@ public sealed class CollectorOptions
             .Where(m => !string.IsNullOrWhiteSpace(m))
             .Select(m => m.Trim())
             .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Limits of <paramref name="model"/>; unlisted models get <see cref="GeminiDailyRequestLimit"/> per day.</summary>
+    public GeminiModelLimit LimitFor(string model)
+        => GeminiModelLimits.FirstOrDefault(l => string.Equals(l.Model, model, StringComparison.OrdinalIgnoreCase))
+           ?? new GeminiModelLimit(model, GeminiDailyRequestLimit);
+
     public int GeminiBatchSize { get; set; } = 15;
+
 
     /// <summary>
     /// Fills empty lists with defaults and removes duplicate entries. Called once after configuration binding.
@@ -112,11 +154,22 @@ public sealed class CollectorOptions
             GeminiFallbackModels = [.. DefaultGeminiFallbackModels];
         }
 
+        GeminiModelLimits = GeminiModelLimits.Count == 0
+            ? [.. DefaultGeminiModelLimits]
+            : GeminiModelLimits
+                .Where(l => !string.IsNullOrWhiteSpace(l.Model))
+                .Select(l => l with { Model = l.Model.Trim() })
+                .DistinctBy(l => l.Model, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
         GeminiBatchSize = Math.Max(1, GeminiBatchSize);
     }
 }
 
 public sealed record RssFeedSource(string Name, string Url, string Language);
+
+/// <summary>Free-tier limits of a Gemini model; 0 = no limit.</summary>
+public sealed record GeminiModelLimit(string Model, int RequestsPerDay, int RequestsPerMinute = 0, int TokensPerMinute = 0);
 
 /// <summary>An ESPN soccer league, e.g. ("eng.1", "Premier League").</summary>
 public sealed record LeagueOption(string Slug, string Name);
