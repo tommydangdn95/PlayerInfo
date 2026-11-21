@@ -198,6 +198,47 @@ namespace PlayerInfo.Api.Data.Migrations
                     b.ToTable("Fixtures");
                 });
 
+            modelBuilder.Entity("PlayerInfo.Api.Data.Entities.LeagueTeam", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("EspnId")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<string>("LeagueSlug")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<string>("LogoUrl")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("ShortName")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("LeagueSlug", "EspnId")
+                        .IsUnique();
+
+                    b.ToTable("LeagueTeams");
+                });
+
             modelBuilder.Entity("PlayerInfo.Api.Data.Entities.NewsArticle", b =>
                 {
                     b.Property<long>("Id")

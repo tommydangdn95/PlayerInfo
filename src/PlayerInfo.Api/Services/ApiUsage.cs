@@ -10,8 +10,11 @@ namespace PlayerInfo.Api.Services;
 /// </summary>
 public sealed class ApiUsageRecorder(IDbContextFactory<AppDbContext> dbFactory, ILogger<ApiUsageRecorder> logger)
 {
-    /// <summary>Calls older than this are deleted.</summary>
-    public static readonly TimeSpan Retention = TimeSpan.FromDays(60);
+    /// <summary>Calls older than this are deleted (the dashboards show at most this many days).</summary>
+    public static readonly TimeSpan Retention = TimeSpan.FromDays(20);
+
+    /// <summary>Most days a usage page can ask for: older calls are gone.</summary>
+    public const int MaxDays = 20;
 
     public const string GeminiProvider = "Gemini";
 

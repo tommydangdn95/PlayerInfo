@@ -57,7 +57,7 @@ public sealed class GeminiController(AppDbContext db, GeminiEnricherClient gemin
     [HttpGet("usage")]
     public async Task<IActionResult> GetUsageAsync([FromQuery] int days = 14, CancellationToken ct = default)
     {
-        days = Math.Clamp(days, 1, 60);
+        days = Math.Clamp(days, 1, ApiUsageRecorder.MaxDays);
         var today = GeminiQuotaDay.Today();
         var firstDay = today.AddDays(1 - days);
         var since = GeminiQuotaDay.StartUtc(firstDay);

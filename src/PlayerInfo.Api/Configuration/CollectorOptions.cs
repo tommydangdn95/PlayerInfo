@@ -128,6 +128,12 @@ public sealed class CollectorOptions
 
     public int GeminiBatchSize { get; set; } = 15;
 
+    /// <summary>
+    /// News older than this many days is deleted (with its team links and emptied stories) at the end of every
+    /// news run, keeping the database well under the Neon free tier. 0 = keep forever.
+    /// </summary>
+    public int ArticleRetentionDays { get; set; } = 60;
+
 
     /// <summary>
     /// Fills empty lists with defaults and removes duplicate entries. Called once after configuration binding.

@@ -58,7 +58,16 @@ public sealed class WatchlistController(AppDbContext db, IOptions<CollectorOptio
         DateTime UpdatedAtUtc,
         IReadOnlyList<AliasDto> Aliases);
 
-    public sealed record LeagueTeamResult(string EspnId, string Name, string? ShortName, string? LogoUrl, int? ExistingTeamId);
+    public sealed record LeagueTeamResult(string EspnId, string Name, string? ShortName, string? LogoUrl, int? ExistingTeamId, DateTime UpdatedAtUtc);
+
+    /// <summary>
+    /// European seasons start in August: a league's team list is fixed for a season, so the cached list is fetched
+    /// again only once the season it was fetched in is over (or on demand).
+    /// </summary>
+    public const int SeasonStartMonth = 8;
+
+    /// <summary>Season of a date, named by the year it starts: Nov 2026 and Mar 2027 are both season 2026.</summary>
+    public static int SeasonOf(DateTime utc) => utc.Month >= SeasonStartMonth ? utc.Year : utc.Year - 1;
 
     public sealed record ApiFootballTeamResult(
         int ApiFootballId,
@@ -75,12 +84,17 @@ public sealed class WatchlistController(AppDbContext db, IOptions<CollectorOptio
     [HttpGet("leagues")]
     public IActionResult GetLeagues() => Ok(collectorOptions.Value.Leagues);
 
-    /// <summary>All teams of a configured league from ESPN (no key, no quota), marking those already added.</summary>
+    /// <summary>
+    /// All teams of a configured league, marking those already added. Served from the LeagueTeams cache; ESPN
+    /// (no key, no quota) is called only when the cache is empty, was fetched in an earlier season
+    /// (see <see cref="SeasonOf"/>), or <paramref name="refresh"/> is set. If ESPN fails, the cached list is kept.
+    /// </summary>
     [HttpGet("league-teams")]
     public async Task<IActionResult> GetLeagueTeamsAsync(
         [FromQuery] string? league,
         [FromServices] EspnClient espn,
-        CancellationToken ct)
+        [FromQuery] bool refresh = false,
+        CancellationToken ct = default)
     {
         var slug = FindLeague(league)?.Slug;
         if (slug is null)
@@ -88,14 +102,32 @@ public sealed class WatchlistController(AppDbContext db, IOptions<CollectorOptio
             return BadRequest(new { error = "Giải đấu không hợp lệ." });
         }
 
-        var teams = await espn.GetLeagueTeamsAsync(slug, ct);
-        var espnIds = teams.Select(t => t.Id).ToList();
+        var cached = await db.LeagueTeams.Where(t => t.LeagueSlug == slug).ToListAsync(ct);
+        var stale = cached.Count == 0 || SeasonOf(cached.Min(t => t.UpdatedAtUtc)) != SeasonOf(DateTime.UtcNow);
+        if (refresh || stale)
+        {
+            var fresh = await espn.GetLeagueTeamsAsync(slug, ct);
+            if (fresh.Count > 0)
+            {
+                var now = DateTime.UtcNow;
+                db.LeagueTeams.RemoveRange(cached);
+                cached = fresh
+                    .DistinctBy(t => t.Id)
+                    .Select(t => new LeagueTeam { LeagueSlug = slug, EspnId = t.Id, Name = t.Name, ShortName = t.ShortName, LogoUrl = t.LogoUrl, UpdatedAtUtc = now })
+                    .ToList();
+                db.LeagueTeams.AddRange(cached);
+                await db.SaveChangesAsync(ct);
+            }
+        }
+
+        var espnIds = cached.Select(t => t.EspnId).ToList();
         var existing = await db.Teams.AsNoTracking()
             .Where(t => t.EspnId != null && espnIds.Contains(t.EspnId))
             .ToDictionaryAsync(t => t.EspnId!, t => t.Id, ct);
 
-        return Ok(teams
-            .Select(t => new LeagueTeamResult(t.Id, t.Name, t.ShortName, t.LogoUrl, existing.TryGetValue(t.Id, out var id) ? id : null))
+        return Ok(cached
+            .OrderBy(t => t.Name)
+            .Select(t => new LeagueTeamResult(t.EspnId, t.Name, t.ShortName, t.LogoUrl, existing.TryGetValue(t.EspnId, out var id) ? id : null, t.UpdatedAtUtc))
             .ToList());
     }
 

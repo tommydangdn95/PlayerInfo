@@ -2,7 +2,7 @@ namespace PlayerInfo.Api.Data.Entities;
 
 /// <summary>
 /// One outbound HTTP request of any provider (ESPN, RSS, API-Football, NewsData, Gemini, Telegram), every attempt,
-/// successful or not. Feeds the API usage dashboard and Gemini's per-model daily/minute limits.
+/// successful or not. Feeds the API usage dashboard and Gemini's per-model daily/minute limits. Kept 20 days.
 /// </summary>
 public sealed class ApiCall
 {

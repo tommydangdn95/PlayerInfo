@@ -13,6 +13,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<Story> Stories => Set<Story>();
     public DbSet<NewsSource> NewsSources => Set<NewsSource>();
     public DbSet<ApiCall> ApiCalls => Set<ApiCall>();
+    public DbSet<LeagueTeam> LeagueTeams => Set<LeagueTeam>();
     public DbSet<PlayerInjury> PlayerInjuries => Set<PlayerInjury>();
     public DbSet<PlayerTransfer> PlayerTransfers => Set<PlayerTransfer>();
     public DbSet<Fixture> Fixtures => Set<Fixture>();
@@ -71,6 +72,15 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             e.Property(x => x.HeadlineVi).HasMaxLength(300);
             e.Property(x => x.Topic).HasMaxLength(50);
             e.Property(x => x.Confidence).HasMaxLength(20);
+        });
+
+        modelBuilder.Entity<LeagueTeam>(e =>
+        {
+            e.HasIndex(x => new { x.LeagueSlug, x.EspnId }).IsUnique();
+            e.Property(x => x.LeagueSlug).HasMaxLength(50);
+            e.Property(x => x.EspnId).HasMaxLength(20);
+            e.Property(x => x.Name).HasMaxLength(200);
+            e.Property(x => x.ShortName).HasMaxLength(100);
         });
 
         modelBuilder.Entity<ApiCall>(e =>

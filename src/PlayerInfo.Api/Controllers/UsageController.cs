@@ -52,7 +52,7 @@ public sealed class UsageController(AppDbContext db, QuotaManager quota, IOption
     [HttpGet]
     public async Task<IActionResult> GetAsync([FromQuery] string? day = null, [FromQuery] int days = 14, CancellationToken ct = default)
     {
-        days = Math.Clamp(days, 1, 60);
+        days = Math.Clamp(days, 1, ApiUsageRecorder.MaxDays);
         var date = VnDay.ParseOrToday(day);
         var firstDay = date.AddDays(1 - days);
         var (since, _) = VnDay.UtcRange(firstDay);
