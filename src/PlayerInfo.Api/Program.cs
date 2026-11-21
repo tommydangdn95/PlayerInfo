@@ -65,6 +65,9 @@ else
 builder.Services.AddScoped(sp => sp.GetRequiredService<IDbContextFactory<AppDbContext>>().CreateDbContext());
 
 // ---------------------------------------------------------------- HTTP clients
+// Every outbound call is recorded (ApiCalls) by the trace handler, for the usage dashboard and Gemini limits.
+builder.Services.AddSingleton<ApiUsageRecorder>();
+
 // Quota-guarded providers: no automatic retries, because every attempt costs a request
 // the QuotaManager would not see. API-Football is only used for transfers.
 builder.Services.AddHttpClient<ApiFootballClient>(c => c.BaseAddress = new Uri("https://v3.api-sports.io/"))
@@ -82,6 +85,9 @@ builder.Services.AddHttpClient<EspnClient>(c => c.BaseAddress = new Uri(EspnClie
     .AddStandardResilienceHandler();
 
 // Gemini: a batch of 15 summaries can take well over the default 10s attempt timeout.
+// No automatic retries: every attempt costs a request from the model's free quota. Instead the client
+// tries the next fallback model.
+
 builder.Services.AddHttpClient<GeminiEnricherClient>(c =>
     {
         c.BaseAddress = new Uri("https://generativelanguage.googleapis.com/");
@@ -92,8 +98,7 @@ builder.Services.AddHttpClient<GeminiEnricherClient>(c =>
         o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(90);
         o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(200);
         o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(180); // must be >= 2x attempt timeout
-        o.Retry.MaxRetryAttempts = 1;
-        o.Retry.Delay = TimeSpan.FromSeconds(5);
+        DisableRetries(o);
     });
 
 // Telegram: never retry the POST, or a timed-out-but-delivered digest gets sent twice.

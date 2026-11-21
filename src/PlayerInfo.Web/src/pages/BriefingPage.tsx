@@ -171,7 +171,7 @@ export function BriefingPage() {
             <p className="muted small">Tin đồn chuyển nhượng nằm ở phần điểm tin.</p>
           </section>
 
-          <Link to="/" className="small">
+          <Link to="/overview" className="small">
             ← Về tổng quan
           </Link>
         </aside>

@@ -1,5 +1,8 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
+using PlayerInfo.Api.Data.Entities;
+using PlayerInfo.Api.Services;
 
 namespace PlayerInfo.Api.Logging;
 
@@ -8,9 +11,14 @@ namespace PlayerInfo.Api.Logging;
 /// request/response bodies truncated) into the in-memory live log, tagged with the running job.
 /// Registered inside the resilience handler, so each retry attempt is a separate entry.
 /// Headers are never recorded (API keys travel in headers); secrets in URLs are masked.
+/// With a recorder, every attempt is also stored as an <see cref="ApiCall"/> for the usage dashboard
+/// (for Gemini with the model and the token counts of the response).
 /// </summary>
-public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provider) : DelegatingHandler
+public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provider, ApiUsageRecorder? recorder = null) : DelegatingHandler
 {
+    /// <summary>Set by the caller on a request to store how many articles it carries.</summary>
+    public static readonly HttpRequestOptionsKey<int> ArticleCountOption = new("PlayerInfo.ArticleCount");
+
     public const int MaxRequestBodyChars = 8 * 1024;
     public const int MaxResponseBodyChars = 16 * 1024;
 
@@ -25,17 +33,27 @@ public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provid
         var (requestBody, requestTruncated) = await ReadBodyAsync(request.Content, MaxRequestBodyChars, cancellationToken);
         var stopwatch = Stopwatch.StartNew();
 
+        var call = NewCall(request);
         HttpResponseMessage response;
         try
         {
             response = await base.SendAsync(request, cancellationToken);
         }
-        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex)
         {
-            Record("Warning", $"{request.Method} {url} → lỗi: {ex.Message}", ex, new HttpTrace(
-                request.Method.Method, url, null, stopwatch.ElapsedMilliseconds,
-                request.Content?.Headers.ContentType?.ToString(), requestBody, requestTruncated,
-                null, null, null, false, $"{ex.GetType().Name}: {ex.Message}"));
+            // Timeouts surface as cancellation: still a request that counted against the provider.
+            call.Outcome = ex is OperationCanceledException or TimeoutException ? ApiUsageRecorder.Timeout : ApiUsageRecorder.NetworkError;
+            call.DurationMs = (int)stopwatch.ElapsedMilliseconds;
+            await StoreAsync(call);
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                Record("Warning", $"{request.Method} {url} → lỗi: {ex.Message}", ex, new HttpTrace(
+                    request.Method.Method, url, null, stopwatch.ElapsedMilliseconds,
+                    request.Content?.Headers.ContentType?.ToString(), requestBody, requestTruncated,
+                    null, null, null, false, $"{ex.GetType().Name}: {ex.Message}"));
+            }
+
             throw;
         }
 
@@ -52,6 +70,17 @@ public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provid
 
         var elapsed = stopwatch.ElapsedMilliseconds;
         var status = (int)response.StatusCode;
+
+        call.StatusCode = status;
+        call.Outcome = ApiUsageRecorder.OutcomeFor(status);
+        call.DurationMs = (int)elapsed;
+        call.ResponseBytes = responseBytes;
+        if (provider == ApiUsageRecorder.GeminiProvider && status < 400 && response.Content is not null)
+        {
+            ReadGeminiUsage(await response.Content.ReadAsStringAsync(cancellationToken), call);
+        }
+
+        await StoreAsync(call);
         Record(
             status >= 400 ? "Warning" : "Info",
             $"{request.Method} {url} → {status} ({elapsed} ms{(responseBytes is { } b ? ", " + FormatSize(b) : "")})",
@@ -62,6 +91,51 @@ public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provid
                 response.Content?.Headers.ContentType?.ToString(), responseBytes, responseBody, responseTruncated, null));
 
         return response;
+    }
+
+    private ApiCall NewCall(HttpRequestMessage request)
+    {
+        var path = RedactUrl(request.RequestUri).Split('?')[0];
+        var model = GeminiModel().Match(path);
+        return new ApiCall
+        {
+            Provider = provider,
+            Model = provider == ApiUsageRecorder.GeminiProvider && model.Success ? model.Groups[1].Value : null,
+            Endpoint = path.Length > 300 ? path[..300] : path,
+            ArticleCount = request.Options.TryGetValue(ArticleCountOption, out var articles) ? articles : 0,
+            JobId = JobLogContext.Current?.Id
+        };
+    }
+
+    private async Task StoreAsync(ApiCall call)
+    {
+        if (recorder is not null)
+        {
+            await recorder.RecordAsync(call, CancellationToken.None);
+        }
+    }
+
+    /// <summary>Token counts from a generateContent response's usageMetadata.</summary>
+    internal static void ReadGeminiUsage(string json, ApiCall call)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("usageMetadata", out var usage))
+            {
+                return;
+            }
+
+            static int Get(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.TryGetInt32(out var n) ? n : 0;
+            call.PromptTokens = Get(usage, "promptTokenCount");
+            call.OutputTokens = Get(usage, "candidatesTokenCount");
+            call.ThoughtTokens = Get(usage, "thoughtsTokenCount");
+            call.TotalTokens = Get(usage, "totalTokenCount");
+        }
+        catch (JsonException)
+        {
+            // Not JSON: no token counts.
+        }
     }
 
     /// <summary>Masks secret query values and the Telegram bot token in the path.</summary>
@@ -132,11 +206,15 @@ public sealed partial class HttpTraceHandler(LiveLogBuffer buffer, string provid
 
     [GeneratedRegex(@"/bot[^/]+/")]
     private static partial Regex TelegramBotToken();
+
+    [GeneratedRegex(@"/models/([^/:]+):")]
+    private static partial Regex GeminiModel();
 }
 
 public static class HttpTraceExtensions
 {
     /// <summary>Records this client's calls in the live log. Call after the resilience handler so each attempt is traced.</summary>
     public static IHttpClientBuilder AddLiveTrace(this IHttpClientBuilder builder, string provider)
-        => builder.AddHttpMessageHandler(sp => new HttpTraceHandler(sp.GetRequiredService<LiveLogBuffer>(), provider));
+        => builder.AddHttpMessageHandler(sp => new HttpTraceHandler(
+            sp.GetRequiredService<LiveLogBuffer>(), provider, sp.GetRequiredService<ApiUsageRecorder>()));
 }

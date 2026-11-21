@@ -76,17 +76,134 @@ public sealed class ClientsTests
         Assert.Empty(items);
     }
 
-    private static GeminiEnricherClient CreateGemini(StubHttpMessageHandler handler, string key = "test-key", List<string>? fallbacks = null)
-        => new(
-            new HttpClient(handler) { BaseAddress = new Uri("https://generativelanguage.googleapis.com/") },
+    /// <summary>A Gemini client whose HTTP calls go through the trace handler, which records them in ApiCalls.</summary>
+    private static GeminiEnricherClient CreateGemini(
+        StubHttpMessageHandler handler, string key = "test-key", List<string>? fallbacks = null, string? dbName = null,
+        int dailyLimit = 0, List<GeminiModelLimit>? limits = null)
+    {
+        var recorder = TestDbFactory.CreateApiUsage(dbName ?? Guid.NewGuid().ToString());
+        var trace = new PlayerInfo.Api.Logging.HttpTraceHandler(new PlayerInfo.Api.Logging.LiveLogBuffer(), "Gemini", recorder) { InnerHandler = handler };
+        return new(
+            new HttpClient(trace) { BaseAddress = new Uri("https://generativelanguage.googleapis.com/") },
             Options.Create(new ApiKeysOptions { Gemini = key }),
-            Options.Create(new CollectorOptions { GeminiModel = "main-model", GeminiFallbackModels = fallbacks ?? [] }),
+            Options.Create(new CollectorOptions
+            {
+                GeminiModel = "main-model",
+                GeminiFallbackModels = fallbacks ?? [],
+                GeminiDailyRequestLimit = dailyLimit,
+                GeminiModelLimits = limits ?? []
+            }),
+            recorder,
             NullLogger<GeminiEnricherClient>.Instance);
+    }
+
+    private const string GeminiOk = """{"articles":[{"articleId":1,"isRelevant":true,"topic":"Other","claimType":"Report","importance":2,"summaryVi":"x","matchedEntities":[],"storyRef":"N1"}],"stories":[]}""";
+
+    private static ApiCall Gemini(string model, string outcome, DateTime atUtc) => new() { Provider = "Gemini", Model = model, Outcome = outcome, AtUtc = atUtc };
+
+    [Fact]
+    public async Task GeminiEnricherClient_RecordsEveryAttempt_WithModelAndTokenUsage()
+    {
+        var dbName = Guid.NewGuid().ToString();
+        var withUsage = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            candidates = new[] { new { content = new { parts = new[] { new { text = GeminiOk } } } } },
+            usageMetadata = new { promptTokenCount = 1200, candidatesTokenCount = 300, thoughtsTokenCount = 50, totalTokenCount = 1550 }
+        });
+        var handler = new StubHttpMessageHandler(req => req.RequestUri!.AbsolutePath.Contains("main-model")
+            ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            : TestDbFactory.JsonResponse(withUsage));
+
+        using (PlayerInfo.Api.Logging.JobLogContext.Begin("job00001", "News"))
+        {
+            Assert.True((await CreateGemini(handler, fallbacks: ["backup"], dbName: dbName)
+                .EnrichBatchAsync([new NewsArticle { Id = 1, Title = "t", SourceName = "s" }], [], [])).Succeeded);
+        }
+
+        await using var db = TestDbFactory.CreateInMemory(dbName);
+        var calls = db.ApiCalls.OrderBy(c => c.Id).ToList();
+        Assert.Equal(2, calls.Count);
+        Assert.Equal(("main-model", 503, "Overloaded", 0), (calls[0].Model, calls[0].StatusCode, calls[0].Outcome, calls[0].TotalTokens));
+        Assert.Equal(("backup", "Success", 1200, 300, 50, 1550), (calls[1].Model, calls[1].Outcome, calls[1].PromptTokens, calls[1].OutputTokens, calls[1].ThoughtTokens, calls[1].TotalTokens));
+        Assert.All(calls, c => Assert.Equal(("Gemini", "job00001", 1), (c.Provider, c.JobId, c.ArticleCount)));
+        Assert.Equal("https://generativelanguage.googleapis.com/v1beta/models/backup:generateContent", calls[1].Endpoint);
+    }
+
+    [Fact]
+    public async Task GeminiEnricherClient_RateLimitedModel_IsSkippedForTheRun_AndTheNextModelAnswers()
+    {
+        var handler = new StubHttpMessageHandler(req => req.RequestUri!.AbsolutePath.Contains("main-model")
+            ? new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+            : TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse(GeminiOk)));
+        var client = CreateGemini(handler, fallbacks: ["backup"]);
+        var article = new NewsArticle { Id = 1, Title = "t", SourceName = "s" };
+
+        Assert.True((await client.EnrichBatchAsync([article], [], [])).Succeeded);
+        Assert.True((await client.EnrichBatchAsync([article], [], [])).Succeeded);
+
+        // main-model answered 429 once and was not asked again in this run.
+        Assert.Equal(
+            ["main-model", "backup", "backup"],
+            handler.Requests.Select(r => r.RequestUri!.AbsolutePath.Split('/')[^1].Split(':')[0]));
+    }
+
+    [Fact]
+    public async Task GeminiEnricherClient_SkipsModelsThatUsedTheirDailyLimit_FailedCallsIncluded()
+    {
+        var dbName = Guid.NewGuid().ToString();
+        await using (var db = TestDbFactory.CreateInMemory(dbName))
+        {
+            db.ApiCalls.Add(Gemini("main-model", "Overloaded", DateTime.UtcNow)); // failed, still counts
+            db.ApiCalls.Add(Gemini("backup", "Success", DateTime.UtcNow.AddDays(-2))); // another quota day
+            db.ApiCalls.Add(new ApiCall { Provider = "ESPN", AtUtc = DateTime.UtcNow }); // other providers never count
+            await db.SaveChangesAsync();
+        }
+
+        var handler = new StubHttpMessageHandler(_ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse(GeminiOk)));
+        var client = CreateGemini(handler, fallbacks: ["backup"], dbName: dbName, dailyLimit: 1);
+        var article = new NewsArticle { Id = 1, Title = "t", SourceName = "s" };
+
+        // The main model used its 1 request today: the fallback answers instead.
+        Assert.True((await client.EnrichBatchAsync([article], [], [])).Succeeded);
+        Assert.Equal("/v1beta/models/backup:generateContent", Assert.Single(handler.Requests).RequestUri!.AbsolutePath);
+
+        // Both used up: nothing is sent at all.
+        Assert.False((await client.EnrichBatchAsync([article], [], [])).Succeeded);
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public async Task GeminiEnricherClient_SkipsModelsAtTheirPerMinuteLimit()
+    {
+        var dbName = Guid.NewGuid().ToString();
+        await using (var db = TestDbFactory.CreateInMemory(dbName))
+        {
+            db.ApiCalls.Add(Gemini("main-model", "Success", DateTime.UtcNow.AddSeconds(-20)));
+            db.ApiCalls.Add(Gemini("main-model", "Success", DateTime.UtcNow.AddMinutes(-3))); // outside the minute
+            await db.SaveChangesAsync();
+        }
+
+        var handler = new StubHttpMessageHandler(_ => TestDbFactory.JsonResponse(TestDbFactory.GeminiResponse(GeminiOk)));
+        var client = CreateGemini(handler, fallbacks: ["backup"], dbName: dbName,
+            limits: [new("main-model", 500, 1), new("backup", 500, 15)]);
+
+        Assert.True((await client.EnrichBatchAsync([new NewsArticle { Id = 1, Title = "t", SourceName = "s" }], [], [])).Succeeded);
+        Assert.Equal("/v1beta/models/backup:generateContent", Assert.Single(handler.Requests).RequestUri!.AbsolutePath);
+    }
+
+    [Fact]
+    public void GeminiQuotaDay_FollowsPacificMidnight()
+    {
+        // 07:59 UTC on 20 Nov is still 19 Nov in Los Angeles (UTC-8 in November); 08:00 UTC starts 20 Nov.
+        Assert.Equal(new DateOnly(2026, 11, 19), GeminiQuotaDay.Of(new DateTime(2026, 11, 20, 7, 59, 0, DateTimeKind.Utc)));
+        Assert.Equal(new DateOnly(2026, 11, 20), GeminiQuotaDay.Of(new DateTime(2026, 11, 20, 8, 0, 0, DateTimeKind.Utc)));
+        Assert.Equal(new DateTime(2026, 11, 20, 8, 0, 0, DateTimeKind.Utc), GeminiQuotaDay.StartUtc(new DateOnly(2026, 11, 20)));
+    }
 
     [Fact]
     public async Task GeminiEnricherClient_FallsBackToTheNextModel_WhenOverloaded_ButNotOnBadRequest()
     {
-        const string ok = """{"articles":[{"articleId":1,"isRelevant":true,"topic":"Other","claimType":"Report","importance":2,"summaryVi":"x","matchedEntities":[],"storyRef":"N1"}],"stories":[]}""";
+        const string ok = GeminiOk;
         var article = new NewsArticle { Id = 1, Title = "t", SourceName = "s" };
 
         var overloaded = new StubHttpMessageHandler(req => req.RequestUri!.AbsolutePath.Contains("main-model")
@@ -107,11 +224,17 @@ public sealed class ClientsTests
     }
 
     [Fact]
-    public void CollectorOptions_GeminiModels_MainFirst_ThenDefaultFallbacks()
+    public void CollectorOptions_Defaults_HydrogenFirst_ThenFlash_ThenFlashLite_WithFreeTierLimits()
     {
-        var options = new CollectorOptions { GeminiModel = "gemini-3.7-flash" };
+        var options = new CollectorOptions();
         options.ApplyDefaults();
-        Assert.Equal(["gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"], options.GeminiModels());
+
+        Assert.Equal(
+            ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+            options.GeminiModels());
+        Assert.Equal(new GeminiModelLimit("gemini-3.5-flash-lite", 500, 15, 250_000), options.LimitFor("gemini-3.5-flash-lite"));
+        Assert.Equal((20, 5), (options.LimitFor("GEMINI-3.8-FLASH").RequestsPerDay, options.LimitFor("GEMINI-3.8-FLASH").RequestsPerMinute));
+        Assert.Equal(new GeminiModelLimit("some-new-model", 20), options.LimitFor("some-new-model")); // GeminiDailyRequestLimit
     }
 
     [Fact]

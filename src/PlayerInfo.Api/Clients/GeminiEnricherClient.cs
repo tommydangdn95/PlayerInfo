@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using PlayerInfo.Api.Configuration;
 using PlayerInfo.Api.Data.Entities;
+using PlayerInfo.Api.Logging;
 using PlayerInfo.Api.Services;
 
 namespace PlayerInfo.Api.Clients;
@@ -48,8 +49,12 @@ public sealed class GeminiEnricherClient(
     HttpClient http,
     IOptions<ApiKeysOptions> apiKeys,
     IOptions<CollectorOptions> collectorOptions,
+    ApiUsageRecorder usage,
     ILogger<GeminiEnricherClient> logger)
 {
+    /// <summary>Models that answered 429 or reached their daily limit during this client's lifetime (one pipeline run).</summary>
+    private readonly HashSet<string> _exhausted = new(StringComparer.OrdinalIgnoreCase);
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -117,6 +122,7 @@ public sealed class GeminiEnricherClient(
             return GeminiBatchResult.Failed;
         }
 
+
         var payload = new
         {
             contents = new[]
@@ -136,6 +142,12 @@ public sealed class GeminiEnricherClient(
         var answered = false;
         foreach (var model in collectorOptions.Value.GeminiModels())
         {
+            // Every attempt costs a request from that model's own quota: skip models that used it up.
+            if (_exhausted.Contains(model) || await LimitReachedAsync(model, ct))
+            {
+                continue;
+            }
+
             var (ok, retryElsewhere, text) = await SendAsync(model, body, batch.Count, ct);
             if (ok)
             {
@@ -180,8 +192,10 @@ public sealed class GeminiEnricherClient(
     }
 
     /// <summary>
-    /// Calls one model. Overload, rate limits, retired models (404) and timeouts are worth trying on the next
-    /// model; bad requests and auth errors are not.
+    /// Calls one model (the HTTP trace handler records the attempt, its model and tokens). Overload (503),
+    /// retired models (404), other 5xx and timeouts are worth trying on the next model. A rate limit (429) uses up
+    /// only that model's quota (each model has its own), so the model is skipped for the rest of this run and the
+    /// next one is tried. Bad requests and auth errors stop: every model would fail the same way.
     /// </summary>
     private async Task<(bool Ok, bool RetryElsewhere, string? Text)> SendAsync(string model, string body, int batchCount, CancellationToken ct)
     {
@@ -193,15 +207,23 @@ public sealed class GeminiEnricherClient(
             };
             // Key in a header rather than the query string so it never ends up in URLs/logs.
             req.Headers.TryAddWithoutValidation("x-goog-api-key", apiKeys.Value.Gemini);
+            req.Options.Set(HttpTraceHandler.ArticleCountOption, batchCount);
 
             using var res = await http.SendAsync(req, ct);
+            var status = (int)res.StatusCode;
             if (!res.IsSuccessStatusCode)
             {
                 var errBody = await res.Content.ReadAsStringAsync(ct);
-                var status = (int)res.StatusCode;
+                if (status == 429)
+                {
+                    _exhausted.Add(model);
+                }
+
                 var retry = status is 404 or 429 or >= 500;
                 logger.LogWarning("Gemini model {Model} returned {StatusCode}{Next}: {Body}",
-                    model, res.StatusCode, retry ? ", trying the next model" : string.Empty, errBody);
+                    model, res.StatusCode,
+                    status == 429 ? " (its quota is used up; skipping it for this run)" : retry ? ", trying the next model" : string.Empty,
+                    errBody);
                 return (false, retry, null);
             }
 
@@ -213,6 +235,37 @@ public sealed class GeminiEnricherClient(
             logger.LogWarning(ex, "Gemini model {Model} request failed for a batch of {Count} articles", model, batchCount);
             return (false, true, null);
         }
+    }
+
+    /// <summary>True when the model used its requests per day (Google quota day) or per minute, failed requests included.</summary>
+    private async Task<bool> LimitReachedAsync(string model, CancellationToken ct)
+    {
+        var limit = collectorOptions.Value.LimitFor(model);
+
+        if (limit.RequestsPerDay > 0)
+        {
+            var today = await usage.CountGeminiSinceAsync(model, GeminiQuotaDay.StartUtc(GeminiQuotaDay.Today()), ct);
+            if (today >= limit.RequestsPerDay)
+            {
+                logger.LogWarning("Gemini model {Model} used its daily limit ({Used}/{Limit}); skipping it until the quota day resets",
+                    model, today, limit.RequestsPerDay);
+                _exhausted.Add(model);
+                return true;
+            }
+        }
+
+        if (limit.RequestsPerMinute > 0)
+        {
+            var lastMinute = await usage.CountGeminiSinceAsync(model, DateTime.UtcNow.AddMinutes(-1), ct);
+            if (lastMinute >= limit.RequestsPerMinute)
+            {
+                logger.LogWarning("Gemini model {Model} used its per-minute limit ({Used}/{Limit}); trying the next model",
+                    model, lastMinute, limit.RequestsPerMinute);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static string BuildPrompt(IReadOnlyList<NewsArticle> batch, IReadOnlyList<string> trackedEntities, IReadOnlyList<OpenStory> openStories)
