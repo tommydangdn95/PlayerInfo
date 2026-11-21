@@ -67,7 +67,8 @@ public sealed class CollectorPipeline(
         [
             ("IngestNews", IngestNewsAsync),
             ("EnrichNews", EnrichPendingArticlesAsync),
-            ("NotifyTelegram", c => NotifyAsync(label, c))
+            ("NotifyTelegram", c => NotifyAsync(label, c)),
+            ("CleanupOldNews", CleanupOldNewsAsync)
         ];
 
         (string Name, Step Run)[] steps = mode switch
@@ -845,6 +846,51 @@ public sealed class CollectorPipeline(
                       (candidate.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                        name.Contains(candidate, StringComparison.OrdinalIgnoreCase));
            });
+
+    /// <summary>
+    /// Deletes articles older than <see cref="CollectorOptions.ArticleRetentionDays"/> (by both publish and fetch
+    /// date, so an old article fetched today is kept long enough to stop it being fetched again), their team links,
+    /// and stories left without articles.
+    /// </summary>
+    private async Task CleanupOldNewsAsync(CancellationToken ct)
+    {
+        var days = options.Value.ArticleRetentionDays;
+        if (days <= 0)
+        {
+            return;
+        }
+
+        var cutoff = DateTime.UtcNow.AddDays(-days);
+        var oldArticles = db.NewsArticles.Where(a => a.PublishedAtUtc < cutoff && a.FetchedAtUtc < cutoff);
+        var emptyStories = db.Stories.Where(s => s.LastUpdatedUtc < cutoff && !s.Articles.Any());
+
+        int articles, stories;
+        if (db.Database.IsRelational())
+        {
+            // Set-based deletes; the database cascades ArticleEntities and nulls StoryId.
+            articles = await oldArticles.ExecuteDeleteAsync(ct);
+            stories = await emptyStories.ExecuteDeleteAsync(ct);
+        }
+        else
+        {
+            // InMemory (local development, tests): no ExecuteDelete.
+            var toDelete = await oldArticles.Include(a => a.Entities).ToListAsync(ct);
+            db.NewsArticles.RemoveRange(toDelete);
+            await db.SaveChangesAsync(ct);
+            var deletedIds = toDelete.Select(a => a.Id).ToHashSet();
+            var storyList = await db.Stories.Where(s => s.LastUpdatedUtc < cutoff)
+                .Where(s => !db.NewsArticles.Any(a => a.StoryId == s.Id))
+                .ToListAsync(ct);
+            db.Stories.RemoveRange(storyList);
+            await db.SaveChangesAsync(ct);
+            (articles, stories) = (toDelete.Count, storyList.Count);
+        }
+
+        if (articles > 0 || stories > 0)
+        {
+            logger.LogInformation("Deleted {Articles} articles and {Stories} stories older than {Days} days", articles, stories, days);
+        }
+    }
 
     private async Task NotifyAsync(string modeLabel, CancellationToken ct)
     {

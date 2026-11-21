@@ -526,4 +526,33 @@ public sealed class CollectorPipelineTests
         await h.Build().RunAsync(CollectorMode.News);
         Assert.Empty(h.TelegramHandler!.Requests);
     }
+
+    [Fact]
+    public async Task RunAsync_News_DeletesNewsOlderThanTheRetention_WithLinksAndEmptiedStories()
+    {
+        await using var h = new PipelineHarness();
+        var team = await SeedArsenalAsync(h);
+        h.ApiKeys.Gemini = string.Empty;
+        var old = DateTime.UtcNow.AddDays(-h.Collector.ArticleRetentionDays - 1);
+
+        var oldStory = new Story { HeadlineVi = "Cũ", LastUpdatedUtc = old };
+        var mixedStory = new Story { HeadlineVi = "Còn bài mới", LastUpdatedUtc = DateTime.UtcNow };
+        h.Db.Stories.AddRange(oldStory, mixedStory);
+        await h.Db.SaveChangesAsync();
+        var oldArticle = new NewsArticle { UrlHash = "o", Url = "https://x/o", Title = "Old", PublishedAtUtc = old, FetchedAtUtc = old, StoryId = oldStory.Id, IsAiProcessed = true, IsNotified = true };
+        var oldInMixed = new NewsArticle { UrlHash = "m", Url = "https://x/m", Title = "Old too", PublishedAtUtc = old, FetchedAtUtc = old, StoryId = mixedStory.Id, IsAiProcessed = true, IsNotified = true };
+        var recent = new NewsArticle { UrlHash = "r", Url = "https://x/r", Title = "Recent", PublishedAtUtc = DateTime.UtcNow, StoryId = mixedStory.Id, IsAiProcessed = true, IsNotified = true };
+        var oldButJustFetched = new NewsArticle { UrlHash = "j", Url = "https://x/j", Title = "Old, fetched today", PublishedAtUtc = old, IsAiProcessed = true, IsNotified = true };
+        h.Db.NewsArticles.AddRange(oldArticle, oldInMixed, recent, oldButJustFetched);
+        await h.Db.SaveChangesAsync();
+        h.Db.ArticleEntities.Add(new ArticleEntity { ArticleId = oldArticle.Id, EntityType = "Team", EntityId = team.Id });
+        await h.Db.SaveChangesAsync();
+
+        await h.Build().RunAsync(CollectorMode.News);
+
+        await using var read = h.NewContext();
+        Assert.Equal(["Old, fetched today", "Recent"], read.NewsArticles.Select(a => a.Title).OrderBy(t => t).ToList());
+        Assert.Empty(read.ArticleEntities.Where(e => e.ArticleId == oldArticle.Id));
+        Assert.Equal(["Còn bài mới"], read.Stories.Select(st => st.HeadlineVi).ToList());
+    }
 }

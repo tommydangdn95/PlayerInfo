@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { api, errorMessage } from '../api';
-import { leagueName, type Alias, type ApiFootballTeam, type League, type LeagueTeam, type Team } from '../types';
+import { formatDateTime, leagueName, type Alias, type ApiFootballTeam, type League, type LeagueTeam, type Team } from '../types';
 
 export function TeamsPage() {
   const [teams, setTeams] = useState<Team[] | null>(null);
@@ -90,16 +90,22 @@ function useLeagueTeams(slug: string) {
   const [teams, setTeams] = useState<LeagueTeam[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const reload = useCallback(async () => {
-    if (!slug) return;
-    setTeams(null);
-    setError(null);
-    try {
-      setTeams(await api<LeagueTeam[]>(`/api/watchlist/league-teams?league=${encodeURIComponent(slug)}`));
-    } catch (err) {
-      setError(errorMessage(err));
-    }
-  }, [slug]);
+  /** Served from the database cache; refresh = ask ESPN again now. */
+  const reload = useCallback(
+    async (refresh = false) => {
+      if (!slug) return;
+      setTeams(null);
+      setError(null);
+      try {
+        setTeams(
+          await api<LeagueTeam[]>(`/api/watchlist/league-teams?league=${encodeURIComponent(slug)}${refresh ? '&refresh=true' : ''}`),
+        );
+      } catch (err) {
+        setError(errorMessage(err));
+      }
+    },
+    [slug],
+  );
 
   useEffect(() => {
     void reload();
@@ -119,7 +125,7 @@ function AddTeamPanel({ leagues, onAdded }: { leagues: League[]; onAdded: () => 
     if (!league && leagues.length > 0) setLeague(leagues[0].slug);
   }, [leagues, league]);
 
-  const { teams, error: loadError, setTeams } = useLeagueTeams(league);
+  const { teams, error: loadError, setTeams, reload } = useLeagueTeams(league);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -166,7 +172,13 @@ function AddTeamPanel({ leagues, onAdded }: { leagues: League[]; onAdded: () => 
           Tạo từ khóa từ tên đội
         </label>
       </div>
-      <p className="muted small">Danh sách đội lấy từ ESPN (không tốn quota).</p>
+      <p className="muted small">
+        Danh sách đội lấy từ ESPN và lưu trong DB, tự lấy lại khi sang mùa giải mới (tháng 8)
+        {teams && teams.length > 0 && ` (lần cuối: ${formatDateTime(teams[0].updatedAtUtc)})`}.{' '}
+        <button className="btn btn-ghost btn-xs" onClick={() => void reload(true)} disabled={!teams}>
+          Cập nhật từ ESPN
+        </button>
+      </p>
       {(error || loadError) && <div className="alert alert-error">{error ?? loadError}</div>}
       {!teams && !loadError && <p className="muted">Đang tải…</p>}
       {teams && teams.length === 0 && <p className="muted">ESPN không trả về đội nào cho giải này.</p>}

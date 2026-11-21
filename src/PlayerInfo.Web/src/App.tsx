@@ -3,6 +3,7 @@ import { Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-rou
 import { useAuth } from './auth';
 import { BriefingPage } from './pages/BriefingPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { DatabasePage } from './pages/DatabasePage';
 import { GeminiPage } from './pages/GeminiPage';
 import { LoginPage } from './pages/LoginPage';
 import { LogsPage } from './pages/LogsPage';
@@ -27,6 +28,7 @@ const NAV: { to: string; label: string; icon: string; end?: boolean }[] = [
   { to: '/teams', label: 'Đội bóng', icon: '⚽' },
   { to: '/sources', label: 'Nguồn tin', icon: '🗞️' },
   { to: '/gemini', label: 'Gemini', icon: '✨' },
+  { to: '/database', label: 'Cơ sở dữ liệu', icon: '🗄️' },
   { to: '/logs', label: 'Nhật ký', icon: '📜' },
 ];
 
@@ -129,6 +131,7 @@ export function App() {
         <Route path="/sources" element={<SourcesPage />} />
         <Route path="/usage" element={<Navigate to="/" replace />} />
         <Route path="/gemini" element={<GeminiPage />} />
+        <Route path="/database" element={<DatabasePage />} />
         <Route path="/teams" element={<TeamsPage />} />
         <Route path="/logs" element={<LogsPage />} />
       </Route>

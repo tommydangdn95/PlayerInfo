@@ -32,6 +32,8 @@ export interface LeagueTeam {
   shortName: string | null;
   logoUrl: string | null;
   existingTeamId: number | null;
+  /** When the list was last fetched from ESPN (it is cached in the database). */
+  updatedAtUtc: string;
 }
 
 /** API-Football search result, used to link a team for transfers. */
